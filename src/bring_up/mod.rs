@@ -26,7 +26,7 @@
 //!    ([`prepare_vmcs`]). Then check that none of this disturbed the host's
 //!    descriptor tables, and stop if it did.
 //! 6. Launch the guest with VMLAUNCH: the one `GuestKind::SELECTED` names.
-//!    - The test guest ([`run_test_guest`]): `vmx::vmcs::launch` returns
+//!    - The test guest ([`run_test_guest`]): `Vcpu::run` returns
 //!      once the guest has stopped: after its last planned exit, or at an
 //!      exit or failure the exit handler in `vmx::vmexit` does not handle.
 //!      The host state the guest reaches through passthrough emulation
@@ -34,7 +34,7 @@
 //!      so are the CPU's MTRRs, which the guest must never reach.
 //!    - The firmware ([`virtualize_firmware`]): the `ExitBootServices`
 //!      event is created first (`resident::watch_exit_boot_services`), then
-//!      `vmx::vmcs::launch_in_place` returns in VMX non-root operation, as
+//!      `Vcpu::run_in_place` returns in non-root mode, as
 //!      the guest. `run` then returns to `main`, and `main` to the firmware,
 //!      which keeps running virtualized. Step 7 does not run; a stop of the
 //!      firmware halts in the exit handler.
@@ -62,27 +62,28 @@ pub use error::{BringUpError, report_error};
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
 
+use crate::hal::types::{Capabilities, GuestEntry, GuestKind, GuestStop};
+use crate::hal::{ControlCapabilities, HardwareVirtualization, Intercepts as _, NestedPaging, Vcpu as _, backend};
+use crate::host::{FirmwareSelectors, HostEnvironment};
+use crate::hv::features::GuestFeatures;
+use crate::hv::guest::{GUEST_SCRATCH_PORT, GuestMemory};
 use crate::resident::{self, memory};
-use crate::vmx;
-use crate::vmx::VmxCapabilities;
-use crate::vmx::apic::{self, ApicBase, IA32_APIC_BASE, LapicMode};
-use crate::vmx::context_tables::{GdtError, GdtRegion, TssRegion};
-use crate::vmx::cr::{CrControls, CrFixed};
-use crate::vmx::ept::{self, Ept, EptSupport, TypeTables};
-use crate::vmx::exit_bitmaps::ExitBitmaps;
-use crate::vmx::features::GuestFeatures;
-use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
-use crate::vmx::guest_state::{GuestEntry, GuestState};
-use crate::vmx::host::{FirmwareSelectors, HostEnvironment};
-use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
-use crate::vmx::mtrr::{MtrrError, MtrrRegisters, MtrrState};
-use crate::vmx::page;
-use crate::vmx::segment::DescriptorTable;
-use crate::vmx::vmcs::{DesiredControls, GuestKind, GuestStop, VmcsRegion};
-use crate::vmx::vmexit::{VM_EXIT_STACK_SIZE, VmExitStack};
-use crate::vmx::vmxon::VmxOperation;
+use crate::x86::apic::{self, ApicBase, IA32_APIC_BASE, LapicMode};
+use crate::x86::context_tables::{GdtError, GdtRegion, TssRegion};
+use crate::x86::cr::CrControls;
+use crate::x86::msr::IA32_KERNEL_GS_BASE;
+use crate::x86::mtrr::{MtrrError, MtrrRegisters, MtrrState};
+use crate::x86::page;
+use crate::x86::segment::DescriptorTable;
 
-use error::{guest_state_error, vmcs_step};
+/// The backend's nested page tables the exit handler changes.
+type TypeTables = <backend::NestedPaging as NestedPaging>::Tables;
+/// What the backend's nested paging offers.
+type NestedPagingSupport = <backend::NestedPaging as NestedPaging>::Support;
+/// The extension's name, for the log lines.
+const VMX: &str = <backend::HardwareVirtualization as HardwareVirtualization>::NAME;
+
+use error::VcpuError;
 use teardown::FirmwareState;
 
 /// How bring-up ended when everything went to plan.
@@ -111,7 +112,7 @@ impl PassthroughState {
         Self {
             // SAFETY: IA32_KERNEL_GS_BASE exists on every 64-bit CPU, and
             // reading it has no side effect.
-            kernel_gs_base: unsafe { vmx::msr::rdmsr(IA32_KERNEL_GS_BASE) },
+            kernel_gs_base: unsafe { crate::x86::msr::rdmsr(IA32_KERNEL_GS_BASE) },
             // SAFETY: the COM1 scratch register, a byte with no effect on
             // the UART; reading it has no side effect. Aleph0 prints on
             // COM2, so this does not disturb its output.
@@ -140,7 +141,7 @@ struct ContextTables {
 impl ContextTables {
     /// The GDT and TSS pages, which the in-place firmware guest runs on and
     /// the CPU reads through EPT, so hiding must keep them visible
-    /// ([`TypeTables::hide`]). The TSS is a single 64-bit TSS (one page); the
+    /// (`NestedPaging::hide`). The TSS is a single 64-bit TSS (one page); the
     /// GDT spans its base through its limit.
     fn guest_visible_tables(&self) -> [page::Allocation; 2] {
         let pages = |base: u64, bytes: u64| {
@@ -168,13 +169,12 @@ const _: () = assert!(
     !core::mem::needs_drop::<HostEnvironment>()
         && !core::mem::needs_drop::<TssRegion>()
         && !core::mem::needs_drop::<GdtRegion>()
-        && !core::mem::needs_drop::<VmExitStack>()
+        && !core::mem::needs_drop::<backend::Vcpu>()
         && !core::mem::needs_drop::<GuestMemory>()
-        && !core::mem::needs_drop::<Ept>()
+        && !core::mem::needs_drop::<backend::NestedPaging>()
         && !core::mem::needs_drop::<TypeTables>()
-        && !core::mem::needs_drop::<ExitBitmaps>()
-        && !core::mem::needs_drop::<VmxOperation>()
-        && !core::mem::needs_drop::<VmcsRegion>()
+        && !core::mem::needs_drop::<backend::Intercepts>()
+        && !core::mem::needs_drop::<backend::HardwareVirtualization>()
 );
 
 /// Activates the host tables, enters VMX operation, prepares the VMCS,
@@ -193,7 +193,7 @@ const _: () = assert!(
 /// tables, host environment, exit bitmaps, VMXON region, VMCS) stays allocated, even after this
 /// returns. None of these types implement `Drop`, so their pages are never
 /// returned to UEFI. TR keeps pointing at the TSS (see `teardown`). All of
-/// them are resident (`vmx::page`), so after a return to the firmware the
+/// them are resident (`crate::x86::page`), so after a return to the firmware the
 /// OS loses them too.
 pub fn run() -> Result<GuestRun, BringUpError> {
     let context_tables = activate_context_tables()?;
@@ -209,46 +209,47 @@ pub fn run() -> Result<GuestRun, BringUpError> {
             // is still boot services, so this needs no ordering care.
             // SAFETY: the firmware's own GDT, read before activation. Boot
             // services are still running, so it is still live.
-            unsafe { vmx::segment::load_gdtr(&context_tables.firmware_gdtr) };
+            unsafe { crate::x86::segment::load_gdtr(&context_tables.firmware_gdtr) };
             return Err(error);
         }
     };
     let VmxEntry {
-        vmexit_stack,
+        mut vcpu,
         guest,
-        ept,
+        paging,
         host,
-        bitmaps,
+        intercepts,
         controls,
         firmware,
-        vmx_operation,
+        virtualization,
         mtrrs,
         types,
         cr_controls,
     } = entry;
 
     // From here on every path goes through teardown before returning.
-    // SAFETY: VMXON succeeded in `enter_vmx`, so this CPU is in VMX root
-    // operation; outside it the VMCS instructions would raise #UD.
-    let vmcs = unsafe { VmcsRegion::create_current() }.map_err(vmcs_step("creation"));
-    let result = match &vmcs {
+    // SAFETY: `enable` succeeded in `enter_vmx`, so this CPU is in root mode;
+    // outside it the vCPU instructions would fault.
+    let created = unsafe { vcpu.create() }.map_err(BringUpError::Vcpu);
+    let result = match created {
         // Every page Aleph0 keeps is now allocated: finalize the memory
         // (check it is resident, hide it from the guest, publish the type
         // tables), then launch.
-        Ok(_) => finalize_memory(mtrrs, types, &context_tables)
-            .and_then(|()| write_cr_shadowing(&cr_controls))
-            .and_then(|()| launch_guest(&controls, &vmexit_stack, &guest, &ept, &host, &bitmaps, &context_tables)),
-        Err(error) => Err(*error),
+        Ok(()) => finalize_memory(mtrrs, types, &context_tables)
+            .and_then(|()| write_cr_intercepts(&vcpu, &cr_controls))
+            .and_then(|()| launch_guest(&controls, &vcpu, &guest, &paging, &host, &intercepts, &context_tables)),
+        Err(error) => Err(error),
     };
     // This already runs as the guest: the firmware gets the CPU back
     // virtualized, with no teardown and no VMXOFF.
     if let Ok(GuestRun::Virtualized) = result {
         return result;
     }
-    // SAFETY: `vmx_operation` is this CPU's and `vmcs` its only VMCS; the
-    // guest is not running (launch returned, or never happened); `firmware`
-    // was read from the live tables before activation.
-    let left = unsafe { teardown::teardown(vmx_operation, vmcs.as_ref().ok(), &firmware) };
+    // SAFETY: `virtualization` is this CPU's and `vcpu` its only vCPU, used
+    // only if it was created; the guest is not running (launch returned, or
+    // never happened); `firmware` was read from the live tables before
+    // activation.
+    let left = unsafe { teardown::teardown(virtualization, created.is_ok().then_some(&vcpu), &firmware) };
 
     // A failure before teardown explains more than one during it; a
     // teardown failure was printed when it happened.
@@ -261,14 +262,14 @@ pub fn run() -> Result<GuestRun, BringUpError> {
 
 /// What exists once VMXON has succeeded, for the rest of [`run`].
 struct VmxEntry {
-    vmexit_stack: VmExitStack,
+    vcpu: backend::Vcpu,
     guest: GuestMemory,
-    ept: Ept,
+    paging: backend::NestedPaging,
     host: HostEnvironment,
-    bitmaps: ExitBitmaps,
-    controls: VmcsControlMsrs,
+    intercepts: backend::Intercepts,
+    controls: ControlCapabilities,
     firmware: FirmwareState,
-    vmx_operation: VmxOperation,
+    virtualization: backend::HardwareVirtualization,
     /// The guest's MTRRs and the EPT type tables, published to the exit
     /// handler in `launch_guest` after `hide` runs.
     mtrrs: MtrrState,
@@ -284,16 +285,12 @@ struct VmxEntry {
 /// operation. A failure here leaves the CPU outside VMX operation, so `run`
 /// only has to put the firmware's GDTR back.
 fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
-    let vmexit_stack = VmExitStack::allocate()?;
-    log!(
-        "VM-exit stack allocated: top={:#018x} size={VM_EXIT_STACK_SIZE}.",
-        vmexit_stack.top()
-    );
+    let vcpu = backend::Vcpu::allocate().map_err(BringUpError::Vcpu)?;
 
     // shortcut: the firmware guest gets the test guest's pages too, to give
-    // `Ept::build` a page to protect; they are resident, and `finalize_memory`
+    // `NestedPaging::build` a page to protect; they are resident, and `finalize_memory`
     // now hides them from the guest (code read-only, data to the shadow) like
-    // the rest of Aleph0, so no OS reaches them. Drop them once `Ept::build`
+    // the rest of Aleph0, so no OS reaches them. Drop them once `NestedPaging::build`
     // no longer needs a protected page of its own.
     let guest = GuestMemory::allocate()?;
     log!(
@@ -315,88 +312,89 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let (controls, ept_support) = check_vmx_support()?;
 
     // The guest's MTRRs start as the CPU's.
-    let mtrrs = MtrrState::new(vmx::mtrr::read()?)?;
+    let mtrrs = MtrrState::new(crate::x86::mtrr::read()?)?;
     let capabilities = mtrrs.registers().capabilities();
     report::mtrrs(mtrrs.mtrrs());
     let protected_pages = [guest.data_page(), guest.stack_page()];
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the guest pages' addresses their GPAs.
-    let (ept, types) = unsafe {
-        Ept::build(
+    let (paging, types) = unsafe {
+        backend::NestedPaging::build(
             &protected_pages,
             ept_support,
             mtrrs.mtrrs(),
-            ept::spare_pts(capabilities),
+            backend::NestedPaging::spare_tables(capabilities),
         )
-    }?;
-    report::ept(&ept, &types, &protected_pages);
-    let _local_apic = check_local_apic(&ept, &types, ept_support)?;
+    }
+    .map_err(BringUpError::NestedPaging)?;
+    paging.report(&types, &protected_pages);
+    let _local_apic = check_local_apic(&types, ept_support)?;
     // Test only: the guest's read of the Local APIC then meets a PDPT entry
     // the CPU refuses, so the run shows the EPT misconfiguration stop and
     // its walk on real VMX.
     #[cfg(feature = "ept-misconfig-test")]
     if let Some(registers) = _local_apic {
         // SAFETY: before VMLAUNCH: the CPU has never walked the tables.
-        unsafe { types.misconfigure(registers) };
+        unsafe { backend::NestedPaging::misconfigure(&types, registers) };
         log!(
             "ept-misconfig-test: the PDPT entry of GiB {:#x} is now W without R.",
             registers >> 30
         );
     }
 
-    let bitmaps = ExitBitmaps::allocate(GuestKind::SELECTED)?;
-    report::exit_bitmaps(&bitmaps, GuestKind::SELECTED, capabilities);
+    let intercepts = backend::Intercepts::allocate(GuestKind::SELECTED).map_err(BringUpError::Intercepts)?;
+    intercepts.report(GuestKind::SELECTED, capabilities);
     // `mtrrs` and `types` are published to the exit handler only in
     // `launch_guest`, once every page Aleph0 keeps is allocated and `hide`
     // has redirected them to the shadow: no exit, which is the only reader,
     // happens before VMLAUNCH.
-    let hyperv = vmx::hyperv::Detection::read();
+    let hyperv = crate::hv::hyperv::Detection::read();
     report::hyperv(&hyperv);
-    vmx::hyperv::publish(hyperv.offers_interface());
+    crate::hv::hyperv::publish(hyperv.offers_interface());
 
     // Every address the UEFI memory map reaches, which holds the image,
     // every allocation (the EPT tables included) and the firmware stack:
     // not the device space above it, which EPT maps for the guest only.
     // SAFETY: boot services are still active, and UEFI identity-maps memory.
-    let host = unsafe { HostEnvironment::build(ept.memory_map_end(), FirmwareSelectors::read()) }?;
-    report::host_environment(&host, vmx::cr::read_cr3());
+    let host = unsafe { HostEnvironment::build(paging.memory_map_end(), FirmwareSelectors::read()) }?;
+    report::host_environment(&host, crate::x86::cr::read_cr3());
 
     // Recorded before VMXON: once the guest runs, its VM exits clear IF, and
     // teardown turns interrupts back on only if firmware had them on.
     let firmware = FirmwareState {
-        cr3: vmx::cr::read_cr3(),
+        cr3: crate::x86::cr::read_cr3(),
         gdtr: context_tables.firmware_gdtr,
         idtr: context_tables.idtr,
         interrupts_enabled: teardown::interrupts_enabled(),
     };
-    // SAFETY: `check_vmx_support` confirmed VMX support and enablement, and
-    // nothing has entered VMX operation yet.
-    let vmx_operation = unsafe { vmx::vmxon::enter_vmx_root_operation() }?;
-    log!("Entered VMX root operation.");
+    // SAFETY: `check_vmx_support` confirmed support and enablement, and
+    // nothing has entered root mode yet.
+    let virtualization = unsafe { backend::HardwareVirtualization::enable() }.map_err(BringUpError::Virtualization)?;
+    log!("Entered {VMX} root operation.");
 
     // The guest's view of CR0/CR4: it owns only the bits VMX operation fixes,
     // and reads their pre-VMX values (CR4.VMXE = 0) through the read shadows,
     // while GUEST_CR0/CR4 keep the real ones. CR0/CR4 now hold the fixed bits
     // VMXON set; `vmx_operation` kept the values from before it.
-    // SAFETY: VMX operation is active, so the FIXED MSRs exist.
-    let cr_fixed = unsafe { CrFixed::read() };
+    // SAFETY: root mode is active, so the extension is supported.
+    let cr_constraints = unsafe { backend::HardwareVirtualization::cr_constraints() };
     let cr_controls = CrControls::new(
-        cr_fixed,
-        vmx::cr::read_cr0(),
-        vmx::cr::read_cr4(),
-        vmx_operation.original_cr0(),
-        vmx_operation.original_cr4(),
+        cr_constraints,
+        crate::x86::cr::read_cr0(),
+        crate::x86::cr::read_cr4(),
+        virtualization.original_cr0(),
+        virtualization.original_cr4(),
     );
 
     Ok(VmxEntry {
-        vmexit_stack,
+        vcpu,
         guest,
-        ept,
+        paging,
         host,
-        bitmaps,
+        intercepts,
         controls,
         firmware,
-        vmx_operation,
+        virtualization,
         mtrrs,
         types,
         cr_controls,
@@ -408,7 +406,7 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
 fn activate_context_tables() -> Result<ContextTables, BringUpError> {
     // Before anything is loaded, so teardown can give firmware its own GDT
     // back.
-    let firmware_gdtr = vmx::segment::read_gdtr();
+    let firmware_gdtr = crate::x86::segment::read_gdtr();
 
     let tss = TssRegion::allocate()?;
     log!("Context TSS allocated at {:#018x}; TR not loaded yet.", tss.base());
@@ -437,7 +435,7 @@ fn activate_context_tables() -> Result<ContextTables, BringUpError> {
         gdtr: prepared,
         tr: selector,
         tss_base: tss.base(),
-        idtr: vmx::segment::read_idtr(),
+        idtr: crate::x86::segment::read_idtr(),
         firmware_gdtr,
         _tss: tss,
         _gdt: gdt,
@@ -449,46 +447,43 @@ fn activate_context_tables() -> Result<ContextTables, BringUpError> {
 /// guest shares and EPT must map the register page, device memory above the
 /// UEFI memory map, to itself, EPT with UC. In any other mode there is no
 /// register page: the guest skips its read, and this returns `None`.
-fn check_local_apic(ept: &Ept, types: &TypeTables, support: EptSupport) -> Result<Option<u64>, BringUpError> {
+fn check_local_apic(types: &TypeTables, support: NestedPagingSupport) -> Result<Option<u64>, BringUpError> {
     // SAFETY: IA32_APIC_BASE exists on every CPU with a Local APIC, which
     // every x86-64 CPU has, and reading it has no side effects.
-    let apic_base = ApicBase(unsafe { vmx::msr::rdmsr(IA32_APIC_BASE) });
+    let apic_base = ApicBase(unsafe { crate::x86::msr::rdmsr(IA32_APIC_BASE) });
     if apic_base.mode() != LapicMode::Xapic {
         report::local_apic_skipped(apic_base);
         return Ok(None);
     }
-    let registers = apic_base.address(support.rules.physical_address_bits);
+    let registers = apic_base.address(backend::NestedPaging::physical_address_bits(support));
     // SAFETY: boot services are still active, so the firmware's tables are
     // identity-mapped.
-    let translation = unsafe { vmx::paging::walk_current(registers) };
-    let walk = types.walk(ept.eptp(), registers);
-    report::local_apic(apic_base, registers, walk.end);
-    apic::check_registers(registers, translation, walk.end)?;
+    let translation = unsafe { crate::x86::paging::walk_current(registers) };
+    let walk = backend::NestedPaging::walk(types, registers);
+    report::local_apic(apic_base, registers, walk);
+    apic::check_registers(registers, translation, walk)?;
     Ok(Some(registers))
 }
 
 /// Detects VMX, reads the capability MSRs the VMCS controls are chosen from,
 /// and checks that the CPU supports the EPT Aleph0 builds. Returns the MSRs
 /// and what the CPU's EPT offers.
-fn check_vmx_support() -> Result<(VmcsControlMsrs, EptSupport), BringUpError> {
-    match vmx::detect() {
-        VmxCapabilities::Supported => {
-            log!("VMX supported and enabled by firmware.");
+fn check_vmx_support() -> Result<(ControlCapabilities, NestedPagingSupport), BringUpError> {
+    match backend::HardwareVirtualization::detect() {
+        Capabilities::Supported => {
+            log!("{VMX} supported and enabled by firmware.");
         }
-        VmxCapabilities::NotSupportedByCpu => return Err(BringUpError::VmxNotSupportedByCpu),
-        VmxCapabilities::DisabledByFirmware => return Err(BringUpError::VmxDisabledByFirmware),
+        Capabilities::NotSupportedByCpu => return Err(BringUpError::NotSupportedByCpu),
+        Capabilities::DisabledByFirmware => return Err(BringUpError::DisabledByFirmware),
     }
 
-    // SAFETY: `detect` just confirmed VMX support.
-    let controls = unsafe { vmx::msr::read_vmcs_control_msrs() };
-    report::vmx_capabilities(&controls);
+    // SAFETY: `detect` just confirmed support.
+    let controls = unsafe { backend::HardwareVirtualization::control_capabilities() };
+    backend::HardwareVirtualization::report_control_capabilities(&controls);
 
-    let support = ept::check_support(
-        controls.secondary,
-        controls.ept_vpid_cap,
-        vmx::cpuid::physical_address_bits(),
-    )?;
-    report::ept_support(support);
+    let support = backend::NestedPaging::check_support(&controls, crate::x86::cpuid::physical_address_bits())
+        .map_err(BringUpError::NestedPaging)?;
+    backend::NestedPaging::report_support(support);
     Ok((controls, support))
 }
 
@@ -497,12 +492,12 @@ fn check_vmx_support() -> Result<(VmcsControlMsrs, EptSupport), BringUpError> {
 /// guest. Returns once the test guest has stopped, or in VMX non-root
 /// operation once the firmware runs as the guest.
 fn launch_guest(
-    controls: &VmcsControlMsrs,
-    vmexit_stack: &VmExitStack,
+    controls: &ControlCapabilities,
+    vcpu: &backend::Vcpu,
     guest: &GuestMemory,
-    ept: &Ept,
+    paging: &backend::NestedPaging,
     host: &HostEnvironment,
-    bitmaps: &ExitBitmaps,
+    intercepts: &backend::Intercepts,
     context_tables: &ContextTables,
 ) -> Result<GuestRun, BringUpError> {
     let kind = GuestKind::SELECTED;
@@ -516,14 +511,14 @@ fn launch_guest(
             idtr: context_tables.idtr,
         },
     };
-    let features = prepare_vmcs(controls, vmexit_stack, ept, host, bitmaps, kind, entry)?;
+    let features = prepare_vmcs(controls, vcpu, paging, host, intercepts, kind, entry)?;
     check_context_tables_preserved(context_tables)?;
     // Before VMLAUNCH: the exit handler's CPUID and XSETBV read it.
-    vmx::features::publish(features);
+    crate::hv::features::publish(features);
 
     match kind {
-        GuestKind::BuiltInTest => run_test_guest(vmexit_stack),
-        GuestKind::Firmware => virtualize_firmware(),
+        GuestKind::BuiltInTest => run_test_guest(vcpu),
+        GuestKind::Firmware => virtualize_firmware(vcpu),
     }
 }
 
@@ -546,23 +541,22 @@ fn finalize_memory(
     if !matches!(GuestKind::SELECTED, GuestKind::BuiltInTest) {
         hide_resident_memory(&mut types, mtrrs.mtrrs(), context_tables)?;
     }
-    vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
+    crate::hv::vmexit::publish_guest_mtrrs(mtrrs, types);
     Ok(())
 }
 
-/// Writes the CR0/CR4 guest/host masks and read shadows to the current VMCS
-/// (`vmx::cr::CrControls`): the guest owns only the bits VMX operation fixes,
-/// and reads their pre-VMX values (CR4.VMXE = 0) through the shadows, while
-/// GUEST_CR0/CR4 keep the real ones. docs/CONTROL_REGISTERS.md.
-fn write_cr_shadowing(cr_controls: &CrControls) -> Result<(), BringUpError> {
-    // SAFETY: VMX root operation with the VMCS `run` created and made current.
-    unsafe { vmx::vmcs::configure_cr_shadowing(cr_controls) }.map_err(vmcs_step("CR mask/shadow setup"))?;
-    report::cr_controls(cr_controls);
-    Ok(())
+/// Writes the CR0/CR4 guest/host masks and read shadows to the current vCPU
+/// (`crate::x86::cr::CrControls`): the guest owns only the bits root mode
+/// fixes, and reads their pre-root-mode values (the enable bit = 0) through
+/// the shadows, while its real CR0/CR4 keep the real ones.
+/// docs/CONTROL_REGISTERS.md.
+fn write_cr_intercepts(vcpu: &backend::Vcpu, cr_controls: &CrControls) -> Result<(), BringUpError> {
+    // SAFETY: root mode with the vCPU `run` created and made current.
+    unsafe { vcpu.configure_cr_intercepts(cr_controls) }.map_err(BringUpError::Vcpu)
 }
 
 /// Checks, in the UEFI memory map, that every resident allocation
-/// (`vmx::page`) lies in memory the OS keeps after `ExitBootServices`, and
+/// (`crate::x86::page`) lies in memory the OS keeps after `ExitBootServices`, and
 /// prints each one's type. A `LOADER_*` or `BOOT_SERVICES_*` page here would
 /// be reused by the OS while Aleph0 still needs it.
 fn check_resident_memory() -> Result<(), BringUpError> {
@@ -598,7 +592,7 @@ fn check_resident_memory() -> Result<(), BringUpError> {
 
 /// Redirects every page Aleph0 keeps to the EPT shadow page, so the guest
 /// can neither read Aleph0's memory nor rewrite its EPT or exit handler
-/// ([`TypeTables::hide`]). Runs after [`check_resident_memory`], which has
+/// (`NestedPaging::hide`). Runs after [`check_resident_memory`], which has
 /// already confirmed the allocation list is complete (no unlisted
 /// allocation, which would leave a page exposed), and before VMLAUNCH.
 ///
@@ -608,14 +602,15 @@ fn check_resident_memory() -> Result<(), BringUpError> {
 /// descriptor table and triple-fault the guest.
 fn hide_resident_memory(
     types: &mut TypeTables,
-    mtrrs: &vmx::mtrr::Mtrrs,
+    mtrrs: &crate::x86::mtrr::Mtrrs,
     context_tables: &ContextTables,
 ) -> Result<(), BringUpError> {
     let visible = context_tables.guest_visible_tables();
     // SAFETY: still single-threaded with the guest not launched, so the CPU
     // has not walked the EPT and `build`'s tables are not aliased.
-    let hidden = unsafe { types.hide(page::resident_allocations(), mtrrs, &visible) }?;
-    report::hidden(hidden);
+    let hidden = unsafe { backend::NestedPaging::hide(types, page::resident_allocations(), mtrrs, &visible) }
+        .map_err(BringUpError::NestedPaging)?;
+    backend::NestedPaging::report_hidden(hidden);
     Ok(())
 }
 
@@ -623,11 +618,11 @@ fn hide_resident_memory(
 /// place: from VMLAUNCH on, this code is the guest. Returns
 /// [`GuestRun::Virtualized`] in VMX non-root operation, or the launch's
 /// failure in root operation, with the event closed again.
-fn virtualize_firmware() -> Result<GuestRun, BringUpError> {
+fn virtualize_firmware(vcpu: &backend::Vcpu) -> Result<GuestRun, BringUpError> {
     // Before VMLAUNCH: once the firmware is the guest, every firmware call
     // can exit, and one Aleph0 does not handle stops it.
-    let event =
-        resident::watch_exit_boot_services().map_err(|error| BringUpError::ExitBootServicesEvent(error.status()))?;
+    let event = resident::watch_exit_boot_services(crate::x86::cpuid::Vendor::Intel)
+        .map_err(|error| BringUpError::ExitBootServicesEvent(error.status()))?;
     log!("ExitBootServices event created: its VMCALL will tell Aleph0 when boot services end.");
     log!("Launching the firmware in place with VMLAUNCH; its VM exits are reported on serial only.");
     // SAFETY: `prepare_vmcs` wrote the controls, the host state
@@ -635,7 +630,7 @@ fn virtualize_firmware() -> Result<GuestRun, BringUpError> {
     // state of this context (`GuestEntry::InPlace`); the exit stack, EPT
     // tables, host environment and exit bitmaps are never freed, and the
     // handler halts at a stop of the firmware (`GuestKind::Firmware`).
-    match unsafe { vmx::vmcs::launch_in_place() } {
+    match unsafe { vcpu.run_in_place() } {
         Ok(()) => Ok(GuestRun::Virtualized),
         Err(stop) => {
             // Outside VMX operation its VMCALL would raise #UD inside
@@ -651,32 +646,36 @@ fn virtualize_firmware() -> Result<GuestRun, BringUpError> {
 /// Launches the test guest and checks its run once it has stopped: the
 /// exit stack, the host state it reaches through passthrough emulation,
 /// the CPU's MTRRs, and its exit statistics.
-fn run_test_guest(vmexit_stack: &VmExitStack) -> Result<GuestRun, BringUpError> {
+fn run_test_guest(vcpu: &backend::Vcpu) -> Result<GuestRun, BringUpError> {
     log!("Launching the guest with VMLAUNCH; its VM exits are reported on serial only.");
     let before = PassthroughState::read();
-    let mtrrs_before = vmx::mtrr::read();
+    let mtrrs_before = crate::x86::mtrr::read();
     // SAFETY: `prepare_vmcs` wrote the controls, the host state
     // (HOST_RSP/HOST_RIP at the live exit stack and handler) and the guest
     // state; the exit stack, guest pages, EPT tables, host environment and
     // exit bitmaps are never freed.
-    let stop = unsafe { vmx::vmcs::launch() };
+    let stop = unsafe { vcpu.run() };
     // SAFETY: the guest has stopped, so no exit handler runs on the stack.
-    let stack_used = unsafe { vmexit_stack.used() };
-    log!("VM-exit stack: {stack_used} of {VM_EXIT_STACK_SIZE} bytes used.");
+    let stack = unsafe { vcpu.exit_stack_usage() };
+    if let Some((used, size)) = stack {
+        log!("VM-exit stack: {used} of {size} bytes used.");
+    }
     report::passthrough_state(before, PassthroughState::read());
-    let mtrrs_after = vmx::mtrr::read();
+    let mtrrs_after = crate::x86::mtrr::read();
     // The guest has stopped, so no exit handler writes its MTRRs any more.
-    let guest_mtrrs = vmx::vmexit::guest_mtrr_registers();
+    let guest_mtrrs = crate::hv::vmexit::guest_mtrr_registers();
     report::mtrrs_after_guest(&mtrrs_before, &mtrrs_after, guest_mtrrs.as_ref());
     // Before the guest's own result: an overflow corrupts whatever lies below
     // the stack, and the guest's stop may only be its consequence.
-    if stack_used == VM_EXIT_STACK_SIZE {
-        return Err(BringUpError::VmExitStackFull);
+    if let Some((used, size)) = stack
+        && used == size
+    {
+        return Err(BringUpError::VmExitStackFull(size));
     }
     let run = guest_result(stop)?;
     // The guest has stopped, so no exit handler is counting any more.
-    let stats = vmx::vmexit::vcpu_stats();
-    if stats != vmx::guest::expected_stats(&stats) {
+    let stats = crate::hv::vmexit::vcpu_stats();
+    if stats != crate::hv::guest::expected_stats(&stats) {
         return Err(BringUpError::UnexpectedExitStats(stats));
     }
     check_mtrrs_untouched(&mtrrs_before, &mtrrs_after)?;
@@ -697,107 +696,69 @@ fn check_mtrrs_untouched(
     }
 }
 
-/// Fills in the current VMCS: controls for a `kind` guest, with what it is
-/// offered beyond them ([`GuestFeatures`]), EPT pointer, exit bitmaps, host
-/// state, and guest state starting at `entry`. VM entry is not attempted.
-/// Returns the features, for the exit handler.
+/// Fills in the current vCPU: controls for a `kind` guest, with what it is
+/// offered beyond them ([`GuestFeatures`]), the nested page tables, the
+/// intercepts, host state, the exit entry, and guest state starting at
+/// `entry`. VM entry is not attempted. Returns the features, for the exit
+/// handler.
 fn prepare_vmcs(
-    controls: &VmcsControlMsrs,
-    vmexit_stack: &VmExitStack,
-    ept: &Ept,
+    controls: &ControlCapabilities,
+    vcpu: &backend::Vcpu,
+    paging: &backend::NestedPaging,
     host: &HostEnvironment,
-    bitmaps: &ExitBitmaps,
+    intercepts: &backend::Intercepts,
     kind: GuestKind,
     entry: GuestEntry,
 ) -> Result<GuestFeatures, BringUpError> {
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current.
-    unsafe { vmx::vmcs::self_test() }.map_err(vmcs_step("self-test"))?;
-    log!("VMCS self-test passed: VMREAD returned what VMWRITE stored.");
+    // SAFETY: root mode with the vCPU `run` created and made current.
+    unsafe { vcpu.self_test() }.map_err(BringUpError::Vcpu)?;
 
-    // SAFETY: VMX root operation, so the CPU supports VMX.
-    let features = unsafe { GuestFeatures::read(controls.secondary) };
-    let host_cr4 = features.host_cr4(vmx::cr::read_cr4());
-    report::guest_features(features, host_cr4);
-
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current.
-    unsafe {
-        vmx::vmcs::configure_controls(
-            controls,
-            DesiredControls::minimal_64_bit_guest(kind, features.secondary),
-        )
-    }
-    .map_err(vmcs_step("control setup"))?;
-    log!("VMCS controls for the {kind:?} guest written and read back successfully.");
-
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current. The EPT tables are never freed.
-    unsafe { vmx::vmcs::set_ept_pointer(ept.eptp()) }.map_err(vmcs_step("EPT pointer setup"))?;
-    log!(
-        "VMCS EPT pointer {:#018x} (WB, 4-level) written and read back.",
-        ept.eptp().raw()
+    // SAFETY: root mode, so the extension is supported.
+    let cr_constraints = unsafe { backend::HardwareVirtualization::cr_constraints() };
+    let features = GuestFeatures::read(
+        backend::HardwareVirtualization::optional_features(controls),
+        cr_constraints,
     );
+    let host_cr4 = features.host_cr4(crate::x86::cr::read_cr4());
+    backend::HardwareVirtualization::report_guest_features(features.features, features.xcr0, host_cr4);
+    report::guest_features(features);
 
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current. The bitmap pages are never freed.
-    unsafe { bitmaps.write_to_vmcs() }.map_err(vmcs_step("exit bitmap setup"))?;
-    log!("VMCS MSR and I/O bitmap addresses written and read back.");
+    // SAFETY: root mode with the vCPU `run` created and made current.
+    unsafe { vcpu.configure_controls(controls, kind, features.features) }.map_err(BringUpError::Vcpu)?;
 
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current. The host environment's pages are never freed. `host_cr4` is
-    // the running CR4 with at most OSXSAVE added, which the exit handler
-    // runs XSETBV with.
-    unsafe { vmx::vmcs::configure_host_state(&host.vmcs_tables(), host_cr4) }.map_err(vmcs_step("host-state setup"))?;
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current.
-    let exit_controls = unsafe { vmx::vmcs::vmread(vmx::vmcs::fields::VM_EXIT_CONTROLS) }
-        .map_err(vmcs_step("exit-control readback"))?;
-    log!(
-        "VMCS host fields written and read back; host PAT load={} EFER load={}; VM entry not attempted.",
-        exit_controls & vmx::vmcs::fields::VM_EXIT_LOAD_IA32_PAT != 0,
-        exit_controls & vmx::vmcs::fields::VM_EXIT_LOAD_IA32_EFER != 0,
-    );
+    // SAFETY: root mode with the vCPU `run` created and made current. The
+    // nested page tables are never freed.
+    unsafe { vcpu.set_nested_paging(paging) }.map_err(BringUpError::Vcpu)?;
 
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current. The exit stack and the handler stay in place for as long as
-    // the guest can exit.
-    unsafe { vmx::vmcs::configure_host_entry(vmexit_stack.top(), vmx::vmexit::entry_address()) }
-        .map_err(vmcs_step("host entry address setup"))?;
-    log!("VMCS HOST_RSP/HOST_RIP written and read back; VM entry not attempted.");
+    // SAFETY: root mode with the vCPU `run` created and made current. The
+    // intercept maps are never freed.
+    unsafe { vcpu.set_intercepts(intercepts) }.map_err(BringUpError::Vcpu)?;
 
-    // After the controls: they decide whether guest PAT/EFER fields exist.
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current. The controls are written, and the host GDT is live and stable.
-    let guest_state = unsafe { GuestState::from_current(entry) }.map_err(guest_state_error)?;
-    // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current.
-    unsafe { guest_state.write() }.map_err(guest_state_error)?;
-    report::guest_state(&guest_state, entry);
+    // SAFETY: root mode with the vCPU `run` created and made current. The
+    // host environment's pages are never freed. `host_cr4` is the running
+    // CR4 with at most OSXSAVE added, which the exit handler runs XSETBV
+    // with.
+    unsafe { vcpu.configure_host_state(&host.host_tables(), host_cr4) }.map_err(BringUpError::Vcpu)?;
+
+    // SAFETY: root mode with the vCPU `run` created and made current. The
+    // exit stack and the handler stay in place for as long as the guest can
+    // exit.
+    unsafe { vcpu.configure_exit_entry() }.map_err(BringUpError::Vcpu)?;
+
+    // After the controls: they decide which guest state the vCPU needs.
+    // SAFETY: root mode with the vCPU `run` created and made current. The
+    // controls are written, and the host GDT is live and stable.
+    unsafe { vcpu.set_guest_state(entry) }.map_err(BringUpError::Vcpu)?;
 
     Ok(features)
 }
 
 /// Turns the way the guest stopped into bring-up's result.
-fn guest_result(stop: GuestStop) -> Result<GuestRun, BringUpError> {
+fn guest_result(stop: GuestStop<VcpuError>) -> Result<GuestRun, BringUpError> {
     match stop {
         GuestStop::Finished { exits } => Ok(GuestRun::Finished { exits }),
         GuestStop::Unexpected { number, reason } => Err(BringUpError::UnexpectedExit { number, reason }),
-        GuestStop::LaunchFailed {
-            error,
-            instruction_error,
-        } => Err(BringUpError::Vmcs {
-            operation: "launch",
-            error,
-            instruction_error,
-        }),
-        GuestStop::ResumeFailed {
-            error,
-            instruction_error,
-        } => Err(BringUpError::ResumeFailed {
-            error,
-            instruction_error,
-        }),
+        GuestStop::LaunchFailed { error } | GuestStop::ResumeFailed { error } => Err(BringUpError::Vcpu(error)),
     }
 }
 
@@ -806,15 +767,15 @@ fn guest_result(stop: GuestStop) -> Result<GuestRun, BringUpError> {
 /// changed, stops before the launch: the guest-state fields in the VMCS
 /// were copied from the activated tables.
 fn check_context_tables_preserved(expected: &ContextTables) -> Result<(), BringUpError> {
-    let gdtr = vmx::segment::read_gdtr();
-    let tr = vmx::segment::read_tr();
-    let idtr = vmx::segment::read_idtr();
+    let gdtr = crate::x86::segment::read_gdtr();
+    let tr = crate::x86::segment::read_tr();
+    let idtr = crate::x86::segment::read_idtr();
     let same_gdtr = gdtr == expected.gdtr;
     let same_idtr = idtr == expected.idtr;
     let same_tss_base = same_gdtr && tr == expected.tr && {
         // SAFETY: `gdtr` is Aleph0's own GDT (`same_gdtr`), live and never
         // freed.
-        unsafe { vmx::segment::segment_base_from_gdt(&gdtr, tr) == expected.tss_base }
+        unsafe { crate::x86::segment::segment_base_from_gdt(&gdtr, tr) == expected.tss_base }
     };
 
     if same_gdtr && same_idtr && same_tss_base {

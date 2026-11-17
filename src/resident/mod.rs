@@ -3,7 +3,7 @@
 //! whole design.
 //!
 //! - Its pages: everything Aleph0 keeps is allocated as a resident type
-//!   (`vmx::page`), and bring-up checks each allocation's type in the
+//!   (`crate::x86::page`), and bring-up checks each allocation's type in the
 //!   memory map ([`memory_type_at`], [`memory::is_reclaimable`]).
 //! - Its image: the firmware loads Aleph0 as an application, in
 //!   `LOADER_CODE`, and unloads it when `main` returns. `main` therefore
@@ -18,7 +18,6 @@
 pub mod memory;
 pub mod pe;
 
-use core::arch::asm;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
@@ -26,8 +25,10 @@ use uefi::boot::{self, EventType, MemoryType, Tpl};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::{Event, Status};
 
-use crate::vmx::page::{self, PAGE_SIZE, RESIDENT_CODE};
-use crate::vmx::vmcall;
+use crate::hal::{Hypercall as _, backend};
+use crate::hv::vmcall;
+use crate::x86::cpuid::Vendor;
+use crate::x86::page::{self, PAGE_SIZE, RESIDENT_CODE};
 use pe::{Headers, PeError};
 
 /// Why the image could not be copied.
@@ -155,20 +156,29 @@ pub fn memory_type_at(mut regions: impl Iterator<Item = (u64, u64, MemoryType)>,
         .map(|(_, _, memory_type)| memory_type)
 }
 
-/// Has the firmware call [`on_exit_boot_services`] during
-/// `ExitBootServices`: the event that tells Aleph0 when boot services end.
+/// Has the firmware call the `ExitBootServices` callback for `vendor`
+/// during `ExitBootServices`: the event that tells Aleph0 when boot
+/// services end. The callback is picked here, once:
+/// [`on_exit_boot_services`] with the compiled-in backend's hypercall
+/// (VMCALL on Intel), [`on_exit_boot_services_svm`] with VMMCALL on AMD, so
+/// it never asks which CPU it runs on.
 ///
 /// The firmware calls it in the guest, from the copy, so this must run in
 /// the resident image, and the event must be closed if the firmware never
-/// becomes the guest: outside VMX operation its VMCALL would raise #UD.
-pub fn watch_exit_boot_services() -> uefi::Result<Event> {
+/// becomes the guest: outside the guest its VMCALL or VMMCALL would raise
+/// #UD.
+pub fn watch_exit_boot_services(vendor: Vendor) -> uefi::Result<Event> {
+    let callback: unsafe extern "efiapi" fn(Event, Option<NonNull<c_void>>) = match vendor {
+        Vendor::Amd => on_exit_boot_services_svm,
+        Vendor::Intel | Vendor::Other(_) => on_exit_boot_services,
+    };
     // SAFETY: the notify function takes no context, and only makes its
-    // VMCALL, which needs nothing from the firmware.
+    // VMCALL or VMMCALL, which needs nothing from the firmware.
     unsafe {
         boot::create_event(
             EventType::SIGNAL_EXIT_BOOT_SERVICES,
             Tpl::CALLBACK,
-            Some(on_exit_boot_services),
+            Some(callback),
             None,
         )
     }
@@ -182,9 +192,15 @@ unsafe extern "efiapi" fn on_exit_boot_services(_event: Event, _context: Option<
     // guest (bring-up closes it when the launch fails), so the VMCALL exits
     // to Aleph0, which changes no guest register for it and resumes past
     // it. It touches no memory and no stack.
+    unsafe { backend::Hypercall::call(vmcall::BOOT_SERVICES_ENDED) };
+}
+
+/// [`on_exit_boot_services`] on AMD: the same call with VMMCALL.
+unsafe extern "efiapi" fn on_exit_boot_services_svm(_event: Event, _context: Option<NonNull<c_void>>) {
+    // SAFETY: as `on_exit_boot_services`, with the VMMCALL intercept set.
     unsafe {
-        asm!(
-            "vmcall",
+        core::arch::asm!(
+            "vmmcall",
             inout("rcx") vmcall::BOOT_SERVICES_ENDED => _,
             options(nomem, nostack),
         );
