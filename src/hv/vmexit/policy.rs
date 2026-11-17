@@ -126,6 +126,9 @@ impl fmt::Display for Histogram<'_> {
     }
 }
 
-#[cfg(test)]
+// Builds its exits from the Intel backend's encodings (`RawExit`), so it
+// runs with the Intel backend; the AMD backend's decoders have their own
+// tests (`tests/unit/hal/amd`).
+#[cfg(all(test, not(feature = "amd")))]
 #[path = "../../../tests/unit/hv/vmexit/policy.rs"]
 mod tests;

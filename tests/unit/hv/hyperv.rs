@@ -68,7 +68,7 @@ fn the_call_code_is_bits_15_to_0() {
 
 #[test]
 fn the_synthetic_range_covers_hyper_v_and_nothing_in_the_bitmap() {
-    use crate::hal::intel::exit_bitmaps::{MsrAccess, msr_bit};
+    use crate::hal::{Intercepts as _, backend};
     // Guest OS ID, the reference counter, TSC invariant control, the
     // nested SynIC control.
     for msr in [0x4000_0000, 0x4000_0020, 0x4000_0118, 0x4000_1080] {
@@ -79,7 +79,7 @@ fn the_synthetic_range_covers_hyper_v_and_nothing_in_the_bitmap() {
     }
     // Every one of them exits, whatever the bitmap says.
     for msr in [*SYNTHETIC_MSRS.start(), *SYNTHETIC_MSRS.end()] {
-        assert_eq!(msr_bit(msr, MsrAccess::Read), None);
+        assert!(!backend::Intercepts::covers_msr(msr), "{msr:#x}");
     }
 }
 
@@ -138,7 +138,13 @@ fn the_recovery_points_sit_on_the_instructions() {
             *(&raw const hyperv_wrmsr_instruction).cast::<[u8; 2]>(),
         )
     };
-    assert_eq!(vmcall, [0x0F, 0x01, 0xC1]);
+    // The backend's hypercall: VMCALL on Intel, VMMCALL (0F 01 D9) on AMD.
+    let hypercall = if cfg!(feature = "amd") {
+        [0x0F, 0x01, 0xD9]
+    } else {
+        [0x0F, 0x01, 0xC1]
+    };
+    assert_eq!(vmcall, hypercall);
     assert_eq!(rdmsr, [0x0F, 0x32]);
     assert_eq!(wrmsr, [0x0F, 0x30]);
 }

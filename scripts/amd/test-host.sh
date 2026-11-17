@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Runs the host unit tests of the AMD SVM backend (src/arch/amd), of the
-# shared code it uses (src/common, src/hal), and then the whole suite, so a
-# change to the shared code that breaks Intel shows up too. For Linux or WSL.
+# Runs the host unit tests of the AMD SVM backend (src/hal/amd), of the
+# hardware abstraction layer (src/hal), and then the whole suite with each
+# backend, so a change to the shared code that breaks Intel shows up too.
+# For Linux or WSL.
 #
 # The AMD backend's VMCB is plain memory, so most of it runs here for real:
 # the VMCB layout, the intercepts and permission maps, the exit decoding,
@@ -14,11 +15,12 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 target=x86_64-unknown-linux-gnu
 
-# run NAME FILTER: one group of tests, by module path.
+# run NAME FILTER [FEATURES]: one group of tests, by module path, built
+# with the AMD backend (`--features amd`) unless FEATURES says otherwise.
 run() {
     echo "==> $1"
     local output
-    if output=$(cargo test --quiet --target "$target" -- "$2" 2>&1); then
+    if output=$(cargo test --quiet --target "$target" --features "${3:-amd}" -- "$2" 2>&1); then
         grep -E '^test result' <<<"$output"
     else
         grep -E '^test result|FAILED|panicked|^error' <<<"$output"
@@ -27,10 +29,10 @@ run() {
 }
 
 failed=0
-run "AMD backend (src/arch/amd)" "arch::amd::" || failed=1
-run "shared code (src/common)" "common::" || failed=1
+run "AMD backend (src/hal/amd)" "hal::amd::" || failed=1
 run "hardware abstraction layer (src/hal)" "hal::" || failed=1
-run "everything, Intel included" "" || failed=1
+run "everything, with the AMD backend" "" || failed=1
+run "everything, with the Intel backend" "" intel || failed=1
 
 if [ "$failed" -eq 0 ]; then
     echo "host tests: PASS"

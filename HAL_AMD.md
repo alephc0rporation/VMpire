@@ -13,10 +13,12 @@ Rules (same as the Intel redo):
 - Intel stays as it is. AMD adds files; shared code (`bring_up`, `hv`, `host`,
   `resident`, `x86`) does not change unless section 5 says so.
 
-Status: the interface is in place and the Intel backend is behind it. The Intel
-unit tests pass (run by you on x86). Not run yet: the Hyper-V VM (default and
-`-TestGuest`). A mistake found there can still change the interface, and then
-this file changes too.
+Status (2026-11-17): **done for the built-in test guest.** The AMD code is
+behind the six traits (`src/hal/amd/{virtualization,vcpu,vm_exit,
+nested_paging,intercepts,hypercall}.rs`), picked with `--features amd`, and
+the shared code runs it as it runs Intel. Section 9 says what was done.
+Not done: the firmware guest on AMD (`run_in_place`). Not run yet: AMD on
+QEMU or hardware, Intel on Hyper-V.
 
 ---
 
@@ -332,3 +334,159 @@ working.
 - RVM1.5 `src/arch/x86_64/amd/` (vmcb, npt, vcpu).
 - SimpleSvm (tandasat): small, readable VMRUN loop.
 - HAL_PLAN.md section 6, HAL_MAPPING.md: how other hypervisors split Intel / AMD.
+
+---
+
+## 8. Routing the existing AMD code through the HAL: your choices
+
+Written 2026-11-17 after merging `amd-plans` (commit 35d4ea5, "added amd for
+hal"). That code does **not** go through the HAL: `src/hal/amd` implements
+none of the six traits. It is a second hypervisor next to the shared one,
+with its own bring-up (`bring_up.rs`), exit handler (`handler.rs`), exit
+decisions (`exit.rs`), guest features, guest MTRRs and test guest, picked
+at run time by the CPU vendor in `main.rs`. Shared code branches on the
+vendor in `resident` and `bring_up`.
+
+The goal: the AMD code implements the six traits, and the shared code
+(`bring_up`, `hv`, `host`, `resident`) runs AMD exactly as it runs Intel.
+
+Nothing below is coded. Tick one option per item, or write your own.
+Where I recommend one it is marked (rec.). Section 5 still holds; where the
+AMD code already answered an item of section 5, the item is repeated here.
+
+- [ ] **D1. How the backend is picked.**
+  - (a) Compile time, as approved in HAL_STRUCTURE.md: Cargo feature `amd`
+    next to `intel`, one image per vendor, `pub use amd as backend`. The
+    vendor match in `main.rs` goes. (rec.)
+  - (b) Run time, as the AMD code does now: one image with both. `backend::`
+    can no longer be a module alias; every trait call goes through an enum
+    or a `dyn` layer. A large interface change.
+- [ ] **D2. The exit loop.** Intel's exit stub calls
+  `hv::vmexit::handler::handle_exit(&mut VmExit, &mut RegisterFrame)`.
+  - (a) AMD's VMRUN loop (`run.rs`) calls the same `handle_exit` after
+    every VMRUN and applies its result. AMD's `handler.rs` (its own
+    `Scenario`, `RunStats`, `GuestStop`, test-guest checks) goes. (rec.)
+  - (b) AMD keeps its own handler; only bring-up goes through the traits.
+- [ ] **D3. The guest's registers.** Intel saves 15 GPRs in the frame;
+  AMD's loop saves 14 (`GprFrame`) and RAX lives in the VMCB.
+  - (a) The AMD loop copies VMCB RAX into the frame before `handle_exit`
+    and back after, so `GuestRegisters` stays as it is. (rec.)
+  - (b) RAX read and written through `VmExit` members instead (trait change).
+- [ ] **D4. NMIs.** The AMD code has its own NMI mechanism (`events.rs`):
+  before each VMRUN, with GIF clear, it folds in the host's pending NMI and
+  plans an injection; it ends NMI blocking with an IRET intercept plus a
+  single step (RFLAGS.TF, #DB intercept). The shared code (`hv`) uses the
+  NMI window, `interruptibility()` and `set_nmi_window` instead.
+  - (a) AMD keeps its mechanism inside the backend: `set_nmi_window(on)`
+    arms its IRET/#DB steps, and the backend reports `ExitReason::NmiWindow`
+    when they say the window is open. The IRET and #DB exits it uses never
+    reach `hv`. No trait change. (rec.)
+  - (b) AMD does NMIs entirely itself and `hv` gets no NMI exits on AMD;
+    needs a trait member telling `hv` that.
+  - (c) Change `hv`'s NMI logic to fit both (touches Intel behaviour).
+- [ ] **D5. MSRs the VMCB holds.** VMLOAD/VMSAVE switch KERNEL_GS_BASE,
+  STAR, LSTAR, CSTAR, SFMASK, so on AMD a real RDMSR in the exit handler
+  reads the host's value, not the guest's. `hv` passes intercepted MSRs
+  (KERNEL_GS_BASE, `hv::intercepted`) through with a real RDMSR/WRMSR.
+  - (a) A new `VmExit` member for "the guest's value of an MSR the backend
+    holds" (read and write); Intel returns none. You name it. (rec.)
+  - (b) The AMD loop does not VMLOAD/VMSAVE these (changes the AMD logic).
+- [ ] **D6. AMD copies of shared logic.** These duplicate shared code and
+  would be deleted, the shared one used for both:
+  `features.rs` (vs `hv/features.rs`), `guest_mtrrs.rs` (vs
+  `hv/vmexit/guest_mtrrs.rs`), the decisions in `exit.rs` (`cpuid_policy`,
+  `route_msr`, `rdmsr_action`, `wrmsr_action`, `xsetbv_action`; vs
+  `hv/exit_decision`), `hyperv.rs`'s `vmmcall_action`, `test_guest.rs`
+  (vs `hv/guest.rs`), `handler.rs`, `bring_up.rs`.
+  Kept as the backend: `svm.rs`, `control.rs`, `vmcb.rs`, `guest.rs`,
+  `run.rs`, `registers.rs`, `register_access.rs`, `npt/`, `exit_maps.rs`,
+  `events.rs`, the exit decoding in `exit.rs`, the VMMCALL forwarder.
+  - (a) Delete them; every difference found between a copy and the shared
+    code comes back to you as a question before the copy goes. (rec.)
+  - (b) Keep them.
+- [ ] **D7. The test guest program.** `hv/guest.rs` has Intel's (`vmcall`);
+  the AMD code added `allocate_with` and its own copy with `vmmcall`.
+  - (a) One program in `hv/guest.rs`, its hypercall instruction picked by
+    the feature, as HAL_STRUCTURE.md approved; `allocate_with` reverted.
+    Needs D1 (a). (rec.)
+  - (b) Keep the two programs.
+- [ ] **D8. Host fault and NMI hooks.** The AMD code added `HostHooks` and
+  `host::install` (a recovery function and an `on_nmi` callback, which AMD
+  sets to a no-op) and `hv::hyperv::msr_recovery`. Intel uses
+  `Hypercall::recovery_point`.
+  - (a) Remove `HostHooks`; the host handlers use the backend's
+    `Hypercall::recovery_point` for both vendors. (rec.)
+  - (b) Keep the hooks, and make Intel install them too.
+- [ ] **D9. ExitBootServices callback.** `resident` now has a second
+  callback with `vmmcall` and a vendor match.
+  - (a) Back to one callback calling `backend::Hypercall::call`. (rec.)
+- [ ] **D10. `x86/identity_map.rs` and `x86/page_table.rs`.** The identity
+  map logic taken out of EPT for NPT to share; Intel's EPT still has its
+  own copy.
+  - (a) Keep them in `x86`, Intel unchanged (two copies for now). (rec.)
+  - (b) Intel's EPT uses them too (one copy; changes Intel code).
+  - (c) Move them into `hal/amd`.
+- [ ] **D11. Host PAT.** The AMD code sets the host PAT to `npt::HOST_PAT`
+  while the guest runs (the NPT gets its memory types through PAT
+  indices) and restores the firmware's at teardown.
+  - (a) In `HardwareVirtualization::enable` / `disable`, beside EFER.SVME. (rec.)
+  - (b) In `Vcpu::configure_host_state`, restored in `release`.
+- [ ] **D12. The firmware guest (`run_in_place`).** Not written for AMD
+  (see the explanation of item C in the chat): without `test-guest` the AMD
+  path returns `FirmwareGuestNotBuilt`.
+  - (a) This work routes only the test guest; AMD's `run_in_place`
+    returns an error, which bring-up reports. The firmware guest is the
+    next piece, designed with you (section 5.3). (rec.)
+  - (b) Write it as part of this work.
+- [ ] **D13. Reason counters** (section 5.7, still open).
+  - (a) `REASON_COUNTERS = 0x401`, VMEXIT_INVALID in the "other" counter. (rec.)
+  - (b) A new member mapping a code to a dense index; you name it.
+
+---
+
+## 9. What was done (2026-11-17)
+
+The AMD code from `amd-plans` is behind the traits, with its logic kept.
+Each D item of section 8, as built:
+
+- **D1** Compile time: `--features amd` picks `hal::amd`; without it the
+  backend is Intel (so a build with no features, or both, still has one).
+  The run-time vendor switch in `main.rs` and `x86::cpuid::Vendor` are gone.
+- **D2** `Vcpu::run` is the AMD run loop; it hands every exit to the shared
+  `hv::vmexit::handle_exit`. AMD's own `handler.rs` and `bring_up.rs` are
+  gone; the shared bring-up and teardown run AMD.
+- **D3** The loop copies the VMCB's RAX into the `GuestRegisters` frame and
+  back.
+- **D4** AMD's NMI machinery (`events.rs`) stays in the backend:
+  `inject_event(NMI)` masks NMIs and turns the IRET intercept on;
+  `interruptibility()` reports that masking; `set_nmi_window` /
+  `set_interrupt_window` are opened by the loop with `events::nmi_plan`
+  (IRET intercept or single step) and reported as `NmiWindow` /
+  `InterruptWindow` exits. The IRET and Aleph0's own #DB exits never reach
+  `hv`. Exit 0x61 (NMI) is `ExceptionOrNmi`.
+- **D5** Two trait members added to `VmExit`: `guest_msr(msr)` and
+  `set_guest_msr(msr, value)`. Intel: the real MSR (as before). AMD: the
+  VMCB copy for the MSRs VMLOAD/VMSAVE switch (`vmcb_held_msr`).
+- **D6** Deleted AMD copies: `bring_up.rs`, `handler.rs`, `features.rs`,
+  `guest_mtrrs.rs`, `test_guest.rs`, `exit.rs` (its decode moved into
+  `vm_exit.rs`), `register_access.rs`. `hyperv.rs` became `hypercall.rs`.
+- **D7** One test guest per backend in `hv/guest.rs`, by feature: AMD's
+  program (VMMCALL, SVM CPUID bit) moved there; `allocate_with` reverted.
+- **D8** `HostHooks` removed; the host handlers use
+  `hv::hyperv::recovery` (backend recovery point) and `set_nmi_window`.
+- **D9** One ExitBootServices callback, through `backend::Hypercall::call`.
+- **D10** `x86/identity_map.rs`, `x86/page_table.rs` kept as they are.
+- **D11** Host PAT: `Vcpu::run` switches to `npt::HOST_PAT` with the host
+  environment; `Vcpu::release` puts the firmware's back; `disable` restores
+  CR0/CR4 and clears EFER.SVME.
+- **D12** Firmware guest not built: `set_guest_state(InPlace)` and
+  `run_in_place` return `FirmwareGuestNotBuilt`.
+- **D13** `REASON_COUNTERS = 0x401`; VMEXIT_INVALID counts as "other".
+
+Other changes: `HostTables` has `gdtr_limit` and `idtr_limit` (AMD loads
+GDTR/IDTR itself; Intel ignores them). NRIPS is required
+(`Vcpu::configure_controls`). A VMRUN refused after an exit stops through
+the shared `stop_after_failed_resume`, as Intel's failed VMRESUME.
+Shared unit tests that build exits from Intel's encodings run only with
+the Intel backend; the AMD decoders have their own tests
+(`tests/unit/hal/amd/vm_exit.rs`).

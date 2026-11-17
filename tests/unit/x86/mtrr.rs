@@ -7,7 +7,7 @@
 
 use super::MemoryType::{Uncacheable as UC, WriteBack as WB, WriteCombining as WC, WriteThrough as WT};
 use super::*;
-use crate::hal::intel::ept::{SIZE_1G, SIZE_2M};
+use crate::x86::paging::{SIZE_1G, SIZE_2M};
 
 /// IA32_MTRR_DEF_TYPE with the MTRRs enabled, fixed ranges off, and
 /// `default` as the default type.

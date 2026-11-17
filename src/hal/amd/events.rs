@@ -1,4 +1,4 @@
-//! Part 8: NMIs and the events an exit interrupted. The AMD counterpart of
+//! NMIs and the events an exit interrupted. The AMD counterpart of
 //! the NMI handling in `hv::exit_decision` (`scenario.rs` and the
 //! redelivery in `mod.rs`).
 //!
@@ -37,12 +37,40 @@
 //! ([`redelivery`]), an interrupted NMI as a true NMI.
 
 use super::control::ControlArea;
-use super::exit::EventInjection;
+
+/// The VMCB's EVENTINJ field (offset 0x0A8): the event the next VMRUN
+/// delivers to the guest. Intel's VM-entry interruption information, with
+/// the error code in bits 63:32 of the same field instead of a separate VMCS
+/// field.
+///
+/// ```text
+///  63         32  31    30  12  11          10   8  7      0
+/// ┌─────────────┬─────┬──────┬────────────┬───────┬────────┐
+/// │ error code  │valid│ res. │ error code │ type  │ vector │
+/// │             │     │      │   valid    │       │        │
+/// └─────────────┴─────┴──────┴────────────┴───────┴────────┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventInjection(pub u64);
+
+impl EventInjection {
+    /// Bit 31 (V): inject at the next VMRUN.
+    pub const VALID: u64 = 1 << 31;
+    /// Type 2 (bits 10:8): NMI.
+    const TYPE_NMI: u64 = 2;
+    /// Vector of NMI.
+    const NMI_VECTOR: u64 = 2;
+
+    /// Injects an NMI at the next VMRUN: valid, type NMI, vector 2. The CPU
+    /// clears V after the event is taken, so it injects once.
+    pub const NMI: Self = Self(Self::VALID | (Self::TYPE_NMI << 8) | Self::NMI_VECTOR);
+}
 
 /// SVM exit codes this part handles (AMD64 APM Vol. 2, Appendix C). Like the
 /// intercept bits of word 3, they are 0x60 plus the bit number.
 pub mod code {
     /// A physical NMI while the guest ran (intercept word 3 bit 1).
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
     pub const NMI: u64 = 0x61;
     /// The guest's IRET (intercept word 3 bit 20), before it runs.
     pub const IRET: u64 = 0x74;
@@ -58,13 +86,6 @@ pub const INTERCEPT_IRET: u32 = 1 << 20;
 /// shadow, after STI or MOV SS. Intel's blocking by STI and by MOV SS in
 /// one bit.
 pub const INTERRUPT_SHADOW: u32 = 1 << 0;
-
-/// EVENTINJ type 4 (bits 10:8): a software interrupt, INTn. Re-injecting
-/// one needs the address of the instruction after it, the VMCB's NRIP.
-const TYPE_SOFTWARE_INTERRUPT: u64 = 4;
-/// EVENTINJ type 6: a software exception, INT3 or INTO, which needs NRIP
-/// the same way.
-const TYPE_SOFTWARE_EXCEPTION: u64 = 6;
 
 /// RFLAGS bit 8 (TF): trap after the next instruction, a #DB.
 pub const RFLAGS_TF: u64 = 1 << 8;
@@ -96,16 +117,6 @@ pub struct NmiState {
 }
 
 impl NmiState {
-    /// The state once an NMI the host NMI handler took (`arrived`) is
-    /// folded in: pending for the guest. At most one NMI waits, as on real
-    /// hardware.
-    pub fn with_host_nmi(self, arrived: bool) -> Self {
-        Self {
-            pending: self.pending || arrived,
-            ..self
-        }
-    }
-
     /// The state at an exit with the guest at `rip`: unmasked once the
     /// IRET it was stopped at has run (KVM's `svm_complete_interrupts`).
     /// Every exit starts with this.
@@ -256,42 +267,6 @@ pub fn apply(plan: NmiPlan, control: &mut ControlArea) -> Option<u64> {
         None => {}
     }
     plan.rflags
-}
-
-/// The event the exit interrupted mid-delivery, from `control`'s
-/// EXITINTINFO, re-armed for the next VMRUN; `None` when the exit
-/// interrupted no delivery, or when it was a software interrupt or exception
-/// and the CPU has no NRIP (`next_rip`), without which it cannot be
-/// re-injected (Intel stops the same way without VM_EXIT_INSTRUCTION_LEN).
-///
-/// Vector 2 is re-armed as a true NMI, whatever type EXITINTINFO gives it,
-/// as Intel's redelivery does for Hyper-V's type-3 report of an NMI.
-pub fn redelivery(control: &ControlArea, next_rip: bool) -> Option<EventInjection> {
-    let info = EventInjection(u64::from(control.exit_int_info) | (u64::from(control.exit_int_info_err) << 32));
-    if !info.is_valid() {
-        return None;
-    }
-    let event_type = (info.0 >> 8) & 0b111;
-    if info.vector() == Some(2) && matches!(event_type, 2 | 3) {
-        return Some(EventInjection::NMI);
-    }
-    if matches!(event_type, TYPE_SOFTWARE_INTERRUPT | TYPE_SOFTWARE_EXCEPTION) && !next_rip {
-        return None;
-    }
-    // Bits 30:12 are reserved in EVENTINJ; the error code, in bits 63:32,
-    // matters only with EV.
-    let error_code = if info.delivers_error_code() {
-        info.0 & 0xFFFF_FFFF_0000_0000
-    } else {
-        0
-    };
-    Some(EventInjection((info.0 & 0x8000_0FFF) | error_code))
-}
-
-/// Has the next VMRUN deliver `event`: Intel's injection of an NMI or a
-/// re-delivered event, with its error code, in one write.
-pub fn queue(control: &mut ControlArea, event: EventInjection) {
-    control.event_inj = event.0;
 }
 
 #[cfg(test)]

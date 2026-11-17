@@ -9,7 +9,7 @@
 //! firmware's tables, so the tests check what the CPU would resolve.
 
 use super::*;
-use crate::hal::intel::ept::SIZE_2M;
+use crate::x86::paging::SIZE_2M;
 use crate::x86::paging::{self, Mapping};
 
 /// Made-up physical addresses of the tables: the PML4, the PDPT, then the

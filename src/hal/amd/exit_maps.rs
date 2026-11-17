@@ -1,4 +1,4 @@
-//! Part 7 (with part 2's index math): the MSR and I/O permission maps,
+//! The MSR and I/O permission maps,
 //! which guest RDMSR/WRMSR and IN/OUT exit to Aleph0. The AMD counterpart
 //! of `hal::intel::exit_bitmaps`.
 //!

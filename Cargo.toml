@@ -42,8 +42,10 @@ uefi = "0.40"
 # firmware in place.
 [features]
 # The hardware backend (HAL_PLAN.md): only the selected one is built.
+# `amd` selects AMD SVM; without it the backend is Intel VT-x.
 default = ["intel"]
 intel = []
+amd = []
 # Run the built-in test guest instead: the regression mode, with its scripted
 # VMCALLs, teardown and the return to firmware outside VMX operation.
 test-guest = []

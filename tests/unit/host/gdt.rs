@@ -62,6 +62,7 @@ fn every_slot_holds_what_its_selector_names() {
 }
 
 #[test]
+#[cfg(not(feature = "amd"))] // VMCS access rights: the Intel backend's format
 fn code_descriptor_is_flat_64_bit_ring_0() {
     let code = SegmentDescriptor(CODE_64);
     // VMCS access-rights format: G = 1, L = 1, P = 1, DPL 0, S = 1, type
@@ -72,6 +73,7 @@ fn code_descriptor_is_flat_64_bit_ring_0() {
 }
 
 #[test]
+#[cfg(not(feature = "amd"))] // VMCS access rights: the Intel backend's format
 fn data_descriptor_is_flat_read_write_ring_0() {
     let data = SegmentDescriptor(DATA);
     // G = 1, D/B = 1, P = 1, DPL 0, S = 1, type 0x3: the Hyper-V

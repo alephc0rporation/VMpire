@@ -5,7 +5,11 @@
 //! private items.
 
 use super::*;
-use crate::hal::intel::ept::{EPT_EXECUTE, EPT_READ, EPT_RWX, EPT_WRITE};
+// Read, write and execute as bits, to build a walk's permissions from.
+const EPT_READ: u64 = 1 << 0;
+const EPT_WRITE: u64 = 1 << 1;
+const EPT_EXECUTE: u64 = 1 << 2;
+const EPT_RWX: u64 = EPT_READ | EPT_WRITE | EPT_EXECUTE;
 use crate::hal::types::Permissions;
 use crate::x86::paging::PageSize;
 

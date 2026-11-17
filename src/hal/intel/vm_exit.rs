@@ -499,6 +499,14 @@ impl crate::hal::VmExit for VmExit {
         self.read(Field::GuestCr4)
     }
 
+    /// The real MSR: VM entry and exit do not switch the MSRs Aleph0 passes
+    /// through, so the guest's value is the CPU's.
+    unsafe fn guest_msr(&self, msr: u32) -> u64 {
+        // SAFETY: the caller guarantees the MSR exists and has no read side
+        // effect.
+        unsafe { crate::x86::msr::rdmsr(msr) }
+    }
+
     fn record(&self) -> Record {
         Record {
             reason: self.read(Field::Reason).ok().map(|raw| raw as u32),
@@ -534,6 +542,12 @@ impl crate::hal::VmExit for VmExit {
 
     fn set_rip(&mut self, rip: u64) -> Result<(), VmcsError> {
         Self::write(GUEST_RIP, rip)
+    }
+
+    /// The real MSR, as for `guest_msr`.
+    unsafe fn set_guest_msr(&mut self, msr: u32, value: u64) {
+        // SAFETY: the caller guarantees the MSR exists and takes `value`.
+        unsafe { crate::x86::msr::wrmsr(msr, value) }
     }
 
     fn set_interruptibility(&mut self, state: Interruptibility) -> Result<(), VmcsError> {

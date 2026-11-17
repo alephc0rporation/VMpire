@@ -75,6 +75,7 @@ pub enum EventKind {
     Nmi,
     HardwareException,
     SoftwareInterrupt,
+    #[cfg_attr(feature = "amd", allow(dead_code, reason = "decoded by the Intel backend only"))]
     PrivilegedSoftwareException,
     SoftwareException,
     /// A kind Aleph0 never builds, kept as the backend's raw value so a
@@ -248,7 +249,9 @@ pub struct CrWrite {
 pub enum CrAccessKind {
     MovTo,
     MovFrom,
+    #[cfg_attr(feature = "amd", allow(dead_code, reason = "decoded by the Intel backend only"))]
     Clts,
+    #[cfg_attr(feature = "amd", allow(dead_code, reason = "decoded by the Intel backend only"))]
     Lmsw,
 }
 
@@ -413,7 +416,12 @@ pub struct HostSelectors {
 pub struct HostTables {
     pub cr3: u64,
     pub gdtr_base: u64,
+    /// The GDT's limit, for a backend that loads GDTR itself (AMD); a VM
+    /// exit on Intel sets it to 0xFFFF.
+    pub gdtr_limit: u16,
     pub idtr_base: u64,
+    /// The IDT's limit, for a backend that loads IDTR itself (AMD).
+    pub idtr_limit: u16,
     pub tr_base: u64,
     pub selectors: HostSelectors,
 }

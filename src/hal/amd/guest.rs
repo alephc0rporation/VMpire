@@ -1,4 +1,4 @@
-//! Part 3: guest state setup.
+//! Guest state setup.
 //!
 //! The AMD counterpart of `hal::intel::guest_state`. Intel copies the current CPU
 //! state into the VMCS guest fields, converting each segment's access rights
@@ -28,9 +28,11 @@ pub const fn segment_attrib(descriptor: u64) -> u16 {
 /// Attribute Present bit (bit 7). A segment with it clear is unusable; this
 /// is how AMD marks a null segment, in place of Intel's explicit unusable
 /// bit.
+#[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
 pub const SEGMENT_PRESENT: u16 = 1 << 7;
 
 /// Whether a packed attribute marks a usable segment.
+#[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
 pub const fn segment_usable(attrib: u16) -> bool {
     attrib & SEGMENT_PRESENT != 0
 }
@@ -50,6 +52,7 @@ pub fn segment_from_descriptor(selector: u16, descriptor: u64, base: u64) -> Seg
 /// The processor state a guest starts from, as plain values. The run loop
 /// reads these from the live CPU; keeping them in a struct makes
 /// [`into_save_area`](Self::into_save_area) pure and testable.
+#[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestInit {
     pub cr0: u64,
@@ -79,6 +82,7 @@ impl GuestInit {
     /// save-area fields (SYSENTER, STAR/LSTAR, DR6/DR7) stay zero until the
     /// run loop fills them; VMRUN requires EFER.SVME set in the guest EFER,
     /// which the caller includes in `efer`.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
     pub fn into_save_area(self) -> SaveArea {
         let mut save = SaveArea::zeroed();
         save.cr0 = self.cr0;

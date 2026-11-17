@@ -29,8 +29,8 @@ mod idt;
 mod page_tables;
 
 pub use gdt::{FirmwareSelectors, GdtLayoutError};
-pub use handlers::{HostHooks, install, nmi_pending, nmis_taken, take_pending_nmi};
-pub use idt::{InterruptStack, VECTORS};
+pub use handlers::{nmi_pending, nmis_taken, take_pending_nmi};
+pub use idt::InterruptStack;
 pub use page_tables::{HostPageTables, HostPagingError, PageSize};
 
 #[cfg(feature = "host-fault-test")]
@@ -142,7 +142,9 @@ impl HostEnvironment {
         HostTables {
             cr3: self.page_tables.cr3(),
             gdtr_base: self.gdt_base(),
+            gdtr_limit: self.gdt_limit(),
             idtr_base: self.idt_base(),
+            idtr_limit: (idt::VECTORS * GATE_SIZE - 1) as u16,
             tr_base: self.tss.base(),
             selectors: self.selectors,
         }

@@ -27,8 +27,11 @@ pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 /// MSRs whose guest value is a VMCS guest-state field (loaded at VM entry,
 /// saved at VM exit when the controls say so). Listed for
 /// `exit_bitmaps::VMCS_HELD_MSRS`; Aleph0 does not read or write them.
+#[cfg_attr(feature = "amd", allow(dead_code, reason = "used by the Intel backend only"))]
 pub const IA32_DEBUGCTL: u32 = 0x1D9;
+#[cfg_attr(feature = "amd", allow(dead_code, reason = "used by the Intel backend only"))]
 pub const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
+#[cfg_attr(feature = "amd", allow(dead_code, reason = "used by the Intel backend only"))]
 pub const IA32_BNDCFGS: u32 = 0xD90;
 
 /// Reads an arbitrary MSR.

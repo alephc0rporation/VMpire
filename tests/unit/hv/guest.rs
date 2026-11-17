@@ -7,6 +7,7 @@
 use super::*;
 
 #[test]
+#[cfg(not(feature = "amd"))] // the Intel program's bytes
 fn guest_code_sets_xcr0_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls()
  {
     assert_eq!(
@@ -350,4 +351,24 @@ fn expected_stats_keep_what_an_nmi_changes_and_nothing_else() {
     ] {
         assert_ne!(expected_stats(&wrong), wrong);
     }
+}
+
+// The AMD program, from the AMD test guest's tests.
+
+#[test]
+#[cfg(feature = "amd")]
+fn the_amd_guest_code_fits_in_one_page_and_the_nmi_handler_follows_the_main_code() {
+    assert!(guest_code().len() <= PAGE_SIZE);
+    assert!(nmi_handler_offset() > 0 && nmi_handler_offset() < guest_code().len());
+}
+
+#[test]
+#[cfg(feature = "amd")]
+fn the_amd_guest_makes_its_vmmcalls_and_no_vmcall() {
+    let code = guest_code();
+    let count = |pattern: &[u8]| code.windows(pattern.len()).filter(|window| *window == pattern).count();
+    // VMMCALL 0F 01 D9: main #1, main #2 and the NMI handler's.
+    assert_eq!(count(&[0x0F, 0x01, 0xD9]), 3);
+    // VMCALL 0F 01 C1 is Intel's, which would raise #UD on AMD.
+    assert_eq!(count(&[0x0F, 0x01, 0xC1]), 0);
 }

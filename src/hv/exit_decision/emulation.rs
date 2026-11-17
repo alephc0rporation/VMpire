@@ -345,6 +345,9 @@ pub(super) fn io(exit: &ExitInfo) -> ExitEvent {
     }
 }
 
-#[cfg(test)]
+// Builds its exits from the Intel backend's encodings (`RawExit`), so it
+// runs with the Intel backend; the AMD backend's decoders have their own
+// tests (`tests/unit/hal/amd`).
+#[cfg(all(test, not(feature = "amd")))]
 #[path = "../../../tests/unit/hv/exit_decision/emulation.rs"]
 mod tests;

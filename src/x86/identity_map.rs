@@ -1,6 +1,6 @@
 //! What the guest's identity map looks like, whatever the nested page
 //! tables are made of: EPT on Intel (`hal::intel::ept`), NPT on AMD
-//! (`arch::amd::npt`). Only the entries differ between the two; how far the
+//! (`hal::amd::npt`). Only the entries differ between the two; how far the
 //! map reaches, which memory is RAM, the memory type each page gets, how
 //! many PTs to set aside, and the bookkeeping of free PTs are the same, and
 //! live here. The backend code names below (`Ept::build`, `retype`, ...) are

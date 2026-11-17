@@ -56,6 +56,13 @@ pub(super) fn control_register(exit: &ExitInfo) -> ExitEvent {
 
 /// The decision for a MOV that loads `requested` into `cr`, given the bits
 /// that register must have (`fixed0`) and may have (`fixed1`) in root mode.
+#[cfg_attr(
+    feature = "amd",
+    allow(
+        clippy::bad_bit_mask,
+        reason = "SVM's enable bit is in EFER: no CR4 bit is forbidden"
+    )
+)]
 fn decide_mov(cr: CrNumber, requested: u64, fixed0: u64, fixed1: u64) -> ExitEvent {
     // The backend's enable bit (CR4.VMXE): the guest's CPUID hides the
     // extension (`emulation::cpuid_policy`), so on a CPU without it this

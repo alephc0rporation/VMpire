@@ -2,8 +2,9 @@
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
-//! private items. They mirror the NMI and redelivery tests of
-//! `tests/unit/vmx/exit_decision.rs`.
+//! private items. They mirror the NMI tests of
+//! `tests/unit/hv/exit_decision.rs`; the re-delivery decode is tested with
+//! the exit's readers (`tests/unit/hal/amd/vm_exit.rs`).
 
 use super::*;
 use crate::hal::amd::vmcb::Vmcb;
@@ -141,14 +142,6 @@ fn nothing_pending_means_nothing_to_do() {
 }
 
 #[test]
-fn an_nmi_from_the_host_becomes_pending_once() {
-    let idle = NmiState::default();
-    assert_eq!(idle.with_host_nmi(false), idle);
-    assert_eq!(idle.with_host_nmi(true), PENDING);
-    assert_eq!(PENDING.with_host_nmi(true), PENDING);
-}
-
-#[test]
 fn apply_writes_the_injection_intercepts_and_returns_the_rflags() {
     let mut vmcb = Box::new(Vmcb::zeroed());
     let plan = NmiPlan {
@@ -176,64 +169,6 @@ fn the_exit_codes_are_0x60_plus_the_intercept_bit() {
     assert_eq!(code::NMI, 0x60 + 1);
     assert_eq!(code::IRET, 0x60 + u64::from(INTERCEPT_IRET.trailing_zeros()));
     assert_eq!(code::DEBUG, 0x40 + u64::from(INTERCEPT_DB.trailing_zeros()));
-}
-
-/// A VMCB whose EXITINTINFO holds `info`, with error code `error`.
-fn exit_int_info(info: u32, error: u32) -> Box<Vmcb> {
-    let mut vmcb = Box::new(Vmcb::zeroed());
-    vmcb.control.exit_int_info = info;
-    vmcb.control.exit_int_info_err = error;
-    vmcb
-}
-
-#[test]
-fn no_valid_exitintinfo_means_no_redelivery() {
-    assert_eq!(redelivery(&exit_int_info(0x0B0E, 4).control, true), None);
-}
-
-#[test]
-fn an_interrupted_nmi_is_re_delivered_as_an_nmi_of_either_type() {
-    for info in [0x8000_0202, 0x8000_0302] {
-        assert_eq!(
-            redelivery(&exit_int_info(info, 0).control, true),
-            Some(EventInjection::NMI),
-            "{info:#x}"
-        );
-    }
-}
-
-#[test]
-fn an_interrupted_page_fault_keeps_its_error_code() {
-    // #PF: type 3, EV, vector 14, error code 0x6.
-    let event = redelivery(&exit_int_info(0x8000_0B0E, 6).control, true).unwrap();
-    assert_eq!(event.vector(), Some(14));
-    assert!(event.delivers_error_code());
-    assert_eq!(event.error_code(), 6);
-    // Without EV the error code is dropped.
-    let event = redelivery(&exit_int_info(0x8000_0320, 6).control, true).unwrap();
-    assert_eq!(event.error_code(), 0);
-}
-
-#[test]
-fn reserved_bits_are_cleared_on_the_way_back() {
-    let event = redelivery(&exit_int_info(0x8000_F030, 0).control, true).unwrap();
-    assert_eq!(event.0, 0x8000_0030);
-}
-
-#[test]
-fn a_software_interrupt_needs_nrip() {
-    // INT 0x80: type 4.
-    assert!(redelivery(&exit_int_info(0x8000_0480, 0).control, true).is_some());
-    assert_eq!(redelivery(&exit_int_info(0x8000_0480, 0).control, false), None);
-    // INT3: type 6.
-    assert_eq!(redelivery(&exit_int_info(0x8000_0603, 0).control, false), None);
-}
-
-#[test]
-fn queue_writes_the_event_with_its_error_code() {
-    let mut vmcb = Box::new(Vmcb::zeroed());
-    queue(&mut vmcb.control, EventInjection(0x0000_0006_8000_0B0E));
-    assert_eq!(vmcb.control.event_inj, 0x0000_0006_8000_0B0E);
 }
 
 #[test]

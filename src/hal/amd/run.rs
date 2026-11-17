@@ -1,4 +1,4 @@
-//! Part 4: the run loop.
+//! The run loop.
 //!
 //! The AMD counterpart of Intel's VMLAUNCH/VMRESUME path (`hal::intel::vmexit`).
 //! Where Intel's exit jumps to HOST_RIP on a separate stack, AMD's `vmrun`
@@ -125,7 +125,14 @@ svm_vmrun:
 );
 
 unsafe extern "C" {
-    fn svm_vmrun(guest_vmcb_pa: u64, host_state_pa: u64, gprs: *mut GprFrame);
+    /// Enters the guest and returns when it exits. `guest_vmcb_pa` is the
+    /// guest VMCB's physical address, `host_state_pa` that of the host state
+    /// page: a zeroed, 4 KiB-aligned page of its own that `vmsave` and
+    /// `vmload` keep the host's FS, GS, TR, LDTR and syscall MSRs in (not the
+    /// `svm::enable` page), and `gprs` the 14 registers the VMCB does not
+    /// hold. Identity-mapped pages make a virtual address its own physical
+    /// address.
+    pub(super) fn svm_vmrun(guest_vmcb_pa: u64, host_state_pa: u64, gprs: *mut GprFrame);
 }
 
 // The asm addresses the frame by the same byte offsets this struct uses:
@@ -142,38 +149,7 @@ const _: () = {
     assert!(offset_of!(GprFrame, r15) == 0x68);
 };
 
-/// One vCPU: its VMCB, and the general-purpose registers the VMCB does not
-/// hold.
-pub struct Vcpu {
-    /// The guest VMCB. Must stay 4 KiB-aligned (it is, being a [`Vmcb`]).
-    pub vmcb: Vmcb,
-    /// The 14 registers saved across `vmrun`.
-    pub gprs: GprFrame,
-}
-
-impl Vcpu {
-    /// Enters the guest and returns when it exits. `host_state_pa` is the
-    /// physical address of the host state page: a zeroed, 4 KiB-aligned page
-    /// of its own that `vmsave` and `vmload` keep the host's FS, GS, TR, LDTR
-    /// and syscall MSRs in. Not the [`svm::enable`](super::svm::enable) page.
-    ///
-    /// # Safety
-    ///
-    /// SVM must be on (`svm::enable`), the VMCB must describe a valid guest
-    /// (`guest::GuestInit`, `control`), and `host_state_pa` must be that live
-    /// host state page. Identity-mapped pages make a virtual address its own
-    /// physical address here; a caller without that mapping must pass the
-    /// real physical addresses instead.
-    pub unsafe fn run(&mut self, host_state_pa: u64) -> RunOutcome {
-        let vmcb_pa = &raw mut self.vmcb as u64;
-        // SAFETY: the caller guarantees SVM is on and the VMCB and host state
-        // page are valid; the asm preserves every callee-saved register.
-        unsafe { svm_vmrun(vmcb_pa, host_state_pa, &raw mut self.gprs) };
-        RunOutcome::read(&self.vmcb)
-    }
-}
-
-/// What a [`Vcpu::run`] left in the VMCB control area.
+/// What a VMRUN ([`svm_vmrun`]) left in the VMCB control area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunOutcome {
     /// `exit_code`: the reason the guest exited ([`VMEXIT_INVALID`] when

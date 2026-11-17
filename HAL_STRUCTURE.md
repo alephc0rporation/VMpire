@@ -567,3 +567,11 @@ exit decoders (`hal/intel/vmexit/decode.rs`: `ExitReason`, `EXIT_REASON_*`,
 backend's own decoders, so every test value is the one it was. 537 test
 markers (533 before; 4 new: Intel feature mapping, published features,
 access rights).
+
+### Added with the AMD backend (2026-11-17)
+
+- `VmExit::guest_msr(msr)` / `VmExit::set_guest_msr(msr, value)`: the
+  guest's value of a passed-through MSR. Intel: the real MSR. AMD: the VMCB
+  copy for the MSRs VMLOAD/VMSAVE switch. See HAL_AMD.md section 9.
+- `HostTables::gdtr_limit`, `HostTables::idtr_limit`: for a backend that
+  loads GDTR/IDTR itself (AMD).

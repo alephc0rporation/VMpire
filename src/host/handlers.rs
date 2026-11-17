@@ -38,40 +38,13 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::idt::{exception_name, has_error_code};
-use crate::hal::{VmExit as _, backend};
+use crate::hal::{HardwareVirtualization, VmExit as _, backend};
+
+/// The backend's extension name, for the report ("VMX").
+const NAME: &str = <backend::HardwareVirtualization as HardwareVirtualization>::NAME;
 use crate::hv::exit_decision::NMI_VECTOR;
 use crate::hv::hyperv;
 use crate::x86::cr::read_cr2;
-
-use core::sync::atomic::AtomicPtr;
-
-/// What the host handlers do on a backend other than the compiled-in one,
-/// picked at run time (`main`): the AMD backend installs its own
-/// ([`install`]). Without hooks the handlers do what they always did, with
-/// the compiled-in backend.
-pub struct HostHooks {
-    /// Where to resume after exception `vector` at `rip`, for an instruction
-    /// forwarded to Hyper-V that it refused; `None` for any other fault.
-    pub recovery: fn(u64, u8) -> Option<u64>,
-    /// Called by the NMI handler after it marks the NMI pending.
-    pub on_nmi: fn(),
-    /// Where Aleph0 runs when these handlers run, for the fault report.
-    pub context: &'static str,
-}
-
-/// The installed hooks; null until [`install`].
-static HOOKS: AtomicPtr<HostHooks> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Installs `hooks`, before the host IDT can be used.
-pub fn install(hooks: &'static HostHooks) {
-    HOOKS.store((hooks as *const HostHooks).cast_mut(), Ordering::Release);
-}
-
-/// The installed hooks, or `None`.
-fn hooks() -> Option<&'static HostHooks> {
-    // SAFETY: only `install` stores a non-null pointer, from a `&'static`.
-    unsafe { HOOKS.load(Ordering::Acquire).as_ref() }
-}
 
 /// Bytes per fault stub: each starts on a 16-byte boundary and fits in it.
 const STUB_SIZE: u64 = 16;
@@ -206,15 +179,13 @@ extern "efiapi" fn host_exception_handler(frame: *mut ExceptionFrame) {
     // else touches it meanwhile.
     let frame = unsafe { &mut *frame };
     let vector = frame.vector as u8;
-    let recovery = hooks().map_or(hyperv::recovery as fn(u64, u8) -> Option<u64>, |hooks| hooks.recovery);
-    if let Some(resume) = recovery(frame.rip, vector) {
+    if let Some(resume) = hyperv::recovery(frame.rip, vector) {
         frame.rip = resume;
         return;
     }
     let tag = crate::TAG;
     crate::serial_println!(
-        "{tag} HOST EXCEPTION in {}: vector {vector} ({}).",
-        hooks().map_or("VMX root operation", |hooks| hooks.context),
+        "{tag} HOST EXCEPTION in {NAME} root operation: vector {vector} ({}).",
         exception_name(vector)
     );
     if has_error_code(vector) {
@@ -239,10 +210,6 @@ extern "efiapi" fn host_exception_handler(frame: *mut ExceptionFrame) {
 extern "efiapi" fn host_nmi_handler() {
     NMIS_TAKEN.fetch_add(1, Ordering::Relaxed);
     NMI_PENDING.store(true, Ordering::Release);
-    if let Some(hooks) = hooks() {
-        (hooks.on_nmi)();
-        return;
-    }
     // SAFETY: this IDT is live only between a VM exit and teardown, so the
     // CPU is in root mode with the guest's vCPU current: exit context.
     // Bring-up checked that the CPU allows the NMI window. A failure leaves
@@ -281,7 +248,7 @@ fn stubs() -> &'static [u8] {
 #[cfg(feature = "host-fault-test")]
 pub fn fault_on_purpose() {
     crate::serial_println!(
-        "{} host-fault-test: reading a non-canonical address in VMX root operation.",
+        "{} host-fault-test: reading a non-canonical address in {NAME} root operation.",
         crate::TAG
     );
     // SAFETY: none: this faults by design. The #GP goes to the host fault

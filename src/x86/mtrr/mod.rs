@@ -141,6 +141,7 @@ impl MemoryType {
     }
 
     /// The encoding: the value the MTRRs and EPT entries hold.
+    #[cfg_attr(feature = "amd", allow(dead_code, reason = "used by the Intel backend only"))]
     pub fn raw(self) -> u64 {
         self as u64
     }

@@ -1,4 +1,4 @@
-//! Part 1: turning SVM on.
+//! Turning SVM on.
 //!
 //! The AMD counterpart of entering VMX root operation. Where Intel checks
 //! `IA32_FEATURE_CONTROL`, sets CR4.VMXE and runs VMXON, AMD checks the SVM

@@ -70,8 +70,9 @@ guest_serial=$out/guest-serial.log
 mkdir -p "$esp/EFI/BOOT"
 rm -f "$serial" "$guest_serial"
 
-features=()
-[ "$test_guest" -eq 1 ] && features=(--features test-guest)
+# The AMD backend is picked at build time by the `amd` feature.
+features=(--features amd)
+[ "$test_guest" -eq 1 ] && features=(--features amd,test-guest)
 echo "==> cargo build ($profile${features:+, ${features[*]}})"
 if [ "$profile" = release ]; then cargo build --quiet --release "${features[@]}"; else cargo build --quiet "${features[@]}"; fi
 cp "target/x86_64-unknown-uefi/$profile/aleph0hypervisor.efi" "$esp/EFI/BOOT/BOOTX64.EFI"

@@ -1,6 +1,7 @@
 //! Hardware abstraction layer: the traits and neutral types the shared code
 //! (`bring_up`, `hv`, `host`, `resident`) uses, and the backends that
-//! implement them. `intel/` is the original VT-x code. The Cargo feature
+//! implement them. `intel/` is the original VT-x code, `amd/` the SVM code.
+//! The Cargo feature (`amd`, or Intel without it)
 //! picks the backend at compile time; shared code calls it as `backend::…`
 //! with the trait in scope. See HAL_STRUCTURE.md and HAL_INTERFACE.md.
 //!
@@ -24,17 +25,20 @@ use types::{
     OptionalFeatures, ReasonDescription, RecoveryPoint, Refused, Retyped, WalkEnd,
 };
 
+#[cfg(feature = "amd")]
 pub mod amd;
+#[cfg(not(feature = "amd"))]
 pub mod intel;
 pub mod types;
 
 pub use types::ExitReason;
 
-#[cfg(feature = "intel")]
+// The `amd` feature selects AMD SVM; without it the backend is Intel VT-x,
+// so a build with no features at all (or both) still has one backend.
+#[cfg(feature = "amd")]
+pub use amd as backend;
+#[cfg(not(feature = "amd"))]
 pub use intel as backend;
-
-#[cfg(not(feature = "intel"))]
-compile_error!("no hardware backend selected: build with the `intel` feature (the default)");
 
 /// The backend's control capabilities ([`HardwareVirtualization::ControlCapabilities`]).
 pub type ControlCapabilities = <backend::HardwareVirtualization as HardwareVirtualization>::ControlCapabilities;
@@ -276,6 +280,15 @@ pub trait VmExit: Sized {
     fn guest_rsp(&self) -> Result<u64, Self::Error>;
     /// The guest's CR4.
     fn guest_cr4(&self) -> Result<u64, Self::Error>;
+    /// The guest's value of `msr`, an MSR its RDMSR reaches through an
+    /// intercept and Aleph0 passes through (`hv::intercepted`). Intel: the
+    /// real MSR, which VM entry and exit do not switch. AMD: the VMCB's copy
+    /// for the MSRs VMLOAD and VMSAVE switch.
+    ///
+    /// # Safety
+    ///
+    /// `msr` exists on this CPU, and reading it has no side effect.
+    unsafe fn guest_msr(&self, msr: u32) -> u64;
     /// What the history keeps of this exit.
     fn record(&self) -> Self::Record;
     /// Whether a field the exit was read from could not be read (the report
@@ -286,6 +299,13 @@ pub trait VmExit: Sized {
 
     /// Resumes at `rip`.
     fn set_rip(&mut self, rip: u64) -> Result<(), Self::Error>;
+    /// The guest's WRMSR of `value` to `msr`, passed through (as for
+    /// [`guest_msr`](Self::guest_msr)).
+    ///
+    /// # Safety
+    ///
+    /// `msr` exists on this CPU and takes `value` without a fault.
+    unsafe fn set_guest_msr(&mut self, msr: u32, value: u64);
     /// Changes the shadows and NMI blocking.
     fn set_interruptibility(&mut self, state: Interruptibility) -> Result<(), Self::Error>;
     /// Delivers `event` at the next entry.

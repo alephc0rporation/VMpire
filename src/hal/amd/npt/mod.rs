@@ -1,4 +1,4 @@
-//! Part 6: nested page tables (NPT), the AMD counterpart of `hal::intel::ept`.
+//! Nested page tables (NPT), the AMD counterpart of `hal::intel::ept`.
 //!
 //! With nested paging on (`control::NESTED_CTL_NP_ENABLE`), every guest
 //! memory access is translated twice, as with EPT:
@@ -327,6 +327,10 @@ impl<L: Level> NptEntry<L> {
     }
 
     /// The entry's bits.
+    #[cfg_attr(
+        not(any(test, feature = "ept-misconfig-test")),
+        allow(dead_code, reason = "used by the unit tests and `misconfigure`")
+    )]
     pub fn raw(self) -> u64 {
         self.raw
     }
@@ -440,6 +444,7 @@ impl NptEntry<Pt> {
     }
 
     /// The memory type the entry gives its page, or `None` for UC-.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
     pub fn memory_type(self) -> Option<MemoryType> {
         pat_type(leaf_pat_index(self.raw, PAT_4K))
     }
@@ -486,12 +491,6 @@ impl Ncr3 {
     /// The nested CR3 for the PML4 table at `pml4`.
     pub fn new(pml4: u64) -> Self {
         Self(pml4 & ADDRESS_MASK)
-    }
-
-    /// The value as the VMCB holds it, read back in exit context: whatever
-    /// its bits, [`walk`] only reads the tables it is given.
-    pub fn from_raw(raw: u64) -> Self {
-        Self(raw)
     }
 
     /// The value as the CPU reads it.
@@ -973,6 +972,41 @@ impl TypeTables {
     /// How [`apply`](Self::apply) has the guest's translations flushed.
     pub fn flush(&self) -> FlushType {
         self.flush
+    }
+
+    /// The N_CR3 of these tables: their PML4.
+    pub fn ncr3(&self) -> Ncr3 {
+        Ncr3::new(self.pml4)
+    }
+
+    /// Test only: makes the PDPT entry of `gpa`'s GiB one the CPU refuses,
+    /// so the guest's access there is a nested page fault with RSVD set: the
+    /// NPT counterpart of `hal::intel::ept`'s `misconfigure`. Address bit 51
+    /// is reserved below a 52-bit MAXPHYADDR; above it, NX without host
+    /// EFER.NXE; with both, the entry loses U/S, which every nested walk
+    /// needs (a fault without RSVD).
+    ///
+    /// # Safety
+    ///
+    /// The CPU must not be using the tables: before the first VMRUN.
+    #[cfg(feature = "ept-misconfig-test")]
+    pub unsafe fn misconfigure(&self, gpa: u64) {
+        let gib = (gpa / SIZE_1G) as usize;
+        assert!(gib < self.layout.gibs, "GPA {gpa:#x} is outside the map");
+        // SAFETY: entry `gib` of the PDPTs `build` filled, `layout.gibs` of
+        // them, never freed; the caller guarantees the CPU is not using them.
+        unsafe {
+            let entry = self.pdpts.add(gib);
+            let raw = entry.read_volatile().raw();
+            let broken = if self.rules.physical_address_bits < 52 {
+                raw | (1 << 51)
+            } else if !self.rules.nx {
+                raw | NO_EXECUTE
+            } else {
+                raw & !USER
+            };
+            entry.write_volatile(NptEntry::from_raw(broken));
+        }
     }
 
     /// Walks `gpa` through the tables `ncr3` names ([`walk`]), reading only

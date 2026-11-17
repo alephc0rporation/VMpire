@@ -35,6 +35,7 @@ pub const CR0_PG: u64 = 1 << 31;
 pub const CR4_LA57: u64 = 1 << 12;
 
 /// CR4 bit 13: VMX-enable. VMXON raises #UD while this is clear.
+#[cfg_attr(feature = "amd", allow(dead_code, reason = "used by the Intel backend only"))]
 pub const CR4_VMXE: u64 = 1 << 13;
 
 /// CR4 bit 18 (OSXSAVE): XGETBV and XSETBV may run, and CPUID.1:ECX bit 27
@@ -92,6 +93,7 @@ control_register!(read_cr4, write_cr4, "cr4");
 /// # Safety
 ///
 /// The CPU must support VMX (CPUID.1:ECX.VMX); otherwise the write faults.
+#[cfg_attr(feature = "amd", allow(dead_code, reason = "used by the Intel backend only"))]
 pub unsafe fn enable_vmxe() {
     // SAFETY: only VMXE changes, which the caller has checked is supported.
     unsafe { write_cr4(read_cr4() | CR4_VMXE) };

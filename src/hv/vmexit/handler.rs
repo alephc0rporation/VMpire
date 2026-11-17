@@ -584,7 +584,11 @@ fn hypercall_names_aleph0(input: u64, frame: &RegisterFrame) -> bool {
 /// guest's registers in `frame`. Only an access to the guest's MTRRs can
 /// fail; one Hyper-V refuses comes back as [`EmulationOutcome::Refused`],
 /// with `frame` unchanged.
-fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationOutcome, ResumeFailure> {
+fn execute(
+    emulation: Emulation,
+    frame: &mut RegisterFrame,
+    exit: &mut backend::VmExit,
+) -> Result<EmulationOutcome, ResumeFailure> {
     Ok(match emulation {
         Emulation::Cpuid {
             leaf,
@@ -621,7 +625,7 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
             // SAFETY: `decide` emulates only INTERCEPTED_MSRS, which exist on
             // every CPU Aleph0 runs on (IA32_KERNEL_GS_BASE: every 64-bit
             // CPU) and have no read side effects.
-            let value = unsafe { msr::rdmsr(msr) };
+            let value = unsafe { exit.guest_msr(msr) };
             // RDMSR writes EAX and EDX, which zero-extends them.
             frame.rax = value & 0xFFFF_FFFF;
             frame.rdx = value >> 32;
@@ -629,10 +633,9 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
         }
         Emulation::Wrmsr { msr, value } => {
             // SAFETY: an intercepted MSR (see Rdmsr), and `decide` checked
-            // the value is canonical, so WRMSR cannot fault. VM entry and
-            // exit do not switch IA32_KERNEL_GS_BASE and Aleph0 never runs
-            // SWAPGS, so the guest's value is simply the CPU's.
-            unsafe { msr::wrmsr(msr, value) };
+            // the value is canonical, so WRMSR cannot fault. Aleph0 never
+            // runs SWAPGS; where the guest's value lives is the backend's.
+            unsafe { exit.set_guest_msr(msr, value) };
             EmulationOutcome::Wrmsr { msr, value }
         }
         Emulation::MtrrRead { msr } => {
@@ -849,7 +852,10 @@ fn prepare_resume(
     };
     // Before RIP moves: the guest resumes past the instruction with its
     // result already in its registers.
-    let emulated = plan.emulate.map(|emulation| execute(emulation, frame)).transpose()?;
+    let emulated = plan
+        .emulate
+        .map(|emulation| execute(emulation, frame, exit))
+        .transpose()?;
     // Hyper-V refused a forwarded access: the guest gets the same exception,
     // at its own instruction, as it would without Aleph0.
     let (plan, advance_to) = match emulated.and_then(EmulationOutcome::refused) {
@@ -952,6 +958,9 @@ pub fn stop_after_failed_resume(frame: &RegisterFrame) {
     halt_unless_returnable(guest);
 }
 
-#[cfg(test)]
+// Builds its exits from the Intel backend's encodings (`RawExit`), so it
+// runs with the Intel backend; the AMD backend's decoders have their own
+// tests (`tests/unit/hal/amd`).
+#[cfg(all(test, not(feature = "amd")))]
 #[path = "../../../tests/unit/hv/vmexit/handler.rs"]
 mod tests;

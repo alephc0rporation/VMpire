@@ -52,6 +52,8 @@
 use core::ptr::NonNull;
 
 use super::vmexit::VcpuStats;
+#[cfg(feature = "amd")]
+use crate::hal::{HardwareVirtualization, backend};
 use crate::hv::exit_decision::NMI_VECTOR;
 use crate::hv::features::CPUID_1_ECX_OSXSAVE;
 use crate::x86::apic::{APIC_BASE_MODE, APIC_BASE_XAPIC, IA32_APIC_BASE, INTEGRATED_APIC_VERSIONS, LAPIC_VERSION};
@@ -157,8 +159,9 @@ pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
 }
 
 // The guest program, in the backend's instructions: Intel's exits to
-// Aleph0 with VMCALL. Only the selected backend's program is built.
-#[cfg(feature = "intel")]
+// Aleph0 with VMCALL, AMD's with VMMCALL. Only the selected backend's
+// program is built.
+#[cfg(not(feature = "amd"))]
 core::arch::global_asm!(
     r#"
     .globl guest_code_start
@@ -417,6 +420,236 @@ guest_code_end:
     apic_version_max = const *INTEGRATED_APIC_VERSIONS.end(),
 );
 
+// AMD's program: Intel's with VMMCALL for VMCALL and the SVM CPUID bit
+// (CPUID.80000001H:ECX bit 2) for the VMX one.
+#[cfg(feature = "amd")]
+core::arch::global_asm!(
+    r#"
+    .globl guest_code_start
+    .globl guest_nmi_handler
+    .globl guest_code_end
+guest_code_start:
+    // CPUID always exits; Aleph0 hides SVM (CPUID.80000001H:ECX bit 2), so
+    // a guest never tries VMRUN.
+    mov eax, 0x80000001
+    xor ecx, ecx
+    cpuid
+    bt ecx, {svm_bit}
+    jc guest_emulation_failed
+    // IA32_KERNEL_GS_BASE exits through the MSRPM; VMSAVE/VMLOAD keep the
+    // guest's value in the VMCB, which Aleph0 reads and writes. Save it,
+    // write GUEST_MSR_VALUE, read it back, restore it.
+    mov ecx, {kernel_gs_base}
+    rdmsr
+    mov esi, eax
+    mov edi, edx
+    mov eax, {msr_low}
+    mov edx, {msr_high}
+    wrmsr
+    xor eax, eax
+    xor edx, edx
+    rdmsr
+    cmp eax, {msr_low}
+    jne guest_emulation_failed
+    cmp edx, {msr_high}
+    jne guest_emulation_failed
+    mov eax, esi
+    mov edx, edi
+    wrmsr
+    // The COM1 scratch register exits through the IOPM; Aleph0 runs the
+    // real IN/OUT. Save it, write GUEST_IO_VALUE, read it back, restore it.
+    mov dx, {scratch_port}
+    in al, dx
+    mov sil, al
+    mov al, {io_value}
+    out dx, al
+    xor eax, eax
+    in al, dx
+    cmp al, {io_value}
+    jne guest_emulation_failed
+    mov al, sil
+    out dx, al
+    // XSETBV exits (its intercept is on); Aleph0 checks the value and runs
+    // it in the host. Turn CR4.OSXSAVE on, which CPUID.1:ECX.OSXSAVE must
+    // then show, write GUEST_XCR0_VALUE, read it back with XGETBV (which
+    // does not exit), restore XCR0, and turn OSXSAVE off.
+    mov rax, cr4
+    bts rax, {cr4_osxsave_bit}
+    mov cr4, rax
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    bt ecx, {cpuid_osxsave_bit}
+    jnc guest_emulation_failed
+    xor ecx, ecx
+    xgetbv
+    mov esi, eax
+    mov edi, edx
+    mov eax, {xcr0_value}
+    xor edx, edx
+    xsetbv
+    xgetbv
+    cmp eax, {xcr0_value}
+    jne guest_emulation_failed
+    test edx, edx
+    jnz guest_emulation_failed
+    mov eax, esi
+    mov edx, edi
+    xsetbv
+    mov rax, cr4
+    btr rax, {cr4_osxsave_bit}
+    mov cr4, rax
+    // RDTSCP runs without an exit: SVM has no control for it.
+    rdtscp
+    // The MTRRs exit through the MSRPM; Aleph0 keeps a copy for the guest
+    // and never writes the CPU's. R10 = the address bits below MAXPHYADDR.
+    mov eax, {address_sizes}
+    cpuid
+    mov ecx, eax
+    mov r10d, 1
+    shl r10, cl
+    dec r10
+    // IA32_MTRRCAP is not intercepted: AL is the number of variable ranges.
+    // Take the last one, ECX = its PHYSBASE, and save its pair.
+    mov ecx, {mtrrcap}
+    rdmsr
+    movzx ecx, al
+    lea ecx, [rcx + rcx + {physbase0} - 2]
+    rdmsr
+    mov r8d, eax
+    mov r9d, edx
+    inc ecx
+    rdmsr
+    mov r11d, eax
+    mov r12d, edx
+    // Off, then GUEST_MTRR_BASE with type UC.
+    xor eax, eax
+    xor edx, edx
+    wrmsr
+    dec ecx
+    mov eax, {mtrr_base_uc}
+    wrmsr
+    // On for 2 MiB: the NPT maps the region as one UC page.
+    inc ecx
+    mov r13, r10
+    and r13, -{two_mib}
+    or r13, {physmask_valid}
+    mov eax, r13d
+    mov rdx, r13
+    shr rdx, 32
+    wrmsr
+    // The copy reads back what was written.
+    xor eax, eax
+    xor edx, edx
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    cmp rax, r13
+    jne guest_emulation_failed
+    // Only 4 KiB: the region's pages differ, so it takes a spare PT.
+    mov r13, r10
+    and r13, -{page_size}
+    or r13, {physmask_valid}
+    mov eax, r13d
+    mov rdx, r13
+    shr rdx, 32
+    wrmsr
+    // Put the pair back: off, base, mask.
+    xor eax, eax
+    xor edx, edx
+    wrmsr
+    dec ecx
+    mov eax, r8d
+    mov edx, r9d
+    wrmsr
+    inc ecx
+    mov eax, r11d
+    mov edx, r12d
+    wrmsr
+    // The Local APIC's version register, in xAPIC mode: device memory the
+    // NPT maps UC, which must not exit.
+    mov ecx, {apic_base_msr}
+    rdmsr
+    mov ecx, eax
+    and ecx, {apic_mode_bits}
+    cmp ecx, {xapic_mode}
+    jne guest_local_apic_done
+    shl rdx, 32
+    or rax, rdx
+    and rax, r10
+    and rax, -{page_size}
+    mov eax, dword ptr [rax + {lapic_version}]
+    cmp al, {apic_version_min}
+    jb guest_emulation_failed
+    cmp al, {apic_version_max}
+    ja guest_emulation_failed
+guest_local_apic_done:
+    // HLT exits, with IF = 0: only Aleph0 resuming past it goes on.
+    hlt
+    xor ebx, ebx
+    // The data page follows the code page.
+    lea rdi, [rip + guest_code_start]
+    add rdi, 0x1000
+    mov ecx, dword ptr [rdi]
+    // The NPT maps the page read-only: a nested page fault, after which
+    // Aleph0 makes it writable and this write runs again.
+    mov dword ptr [rdi], {ept_value}
+    mov edx, dword ptr [rdi]
+    mov eax, {marker}
+    vmmcall
+    // Wait for an NMI; the handler sets EBX. Give up after a while.
+    mov ecx, {iterations}
+guest_wait:
+    test ebx, ebx
+    jnz guest_wait_done
+    pause
+    dec ecx
+    jnz guest_wait
+guest_wait_done:
+    inc eax
+    vmmcall
+    ud2
+guest_nmi_handler:
+    push rax
+    mov eax, {nmi_marker}
+    vmmcall
+    pop rax
+    mov ebx, 1
+    iretq
+guest_emulation_failed:
+    mov eax, {fail_marker}
+    ud2
+guest_code_end:
+"#,
+    svm_bit = const <backend::HardwareVirtualization as HardwareVirtualization>::CPUID_FEATURE.mask.trailing_zeros(),
+    kernel_gs_base = const IA32_KERNEL_GS_BASE,
+    msr_low = const GUEST_MSR_VALUE as u32,
+    msr_high = const (GUEST_MSR_VALUE >> 32) as u32,
+    marker = const GUEST_MARKER,
+    iterations = const GUEST_WAIT_ITERATIONS,
+    nmi_marker = const GUEST_NMI_MARKER,
+    ept_value = const GUEST_EPT_VALUE,
+    fail_marker = const GUEST_EMULATION_FAIL_MARKER,
+    scratch_port = const GUEST_SCRATCH_PORT,
+    io_value = const GUEST_IO_VALUE,
+    cr4_osxsave_bit = const cr::CR4_OSXSAVE.trailing_zeros(),
+    cpuid_osxsave_bit = const CPUID_1_ECX_OSXSAVE.trailing_zeros(),
+    xcr0_value = const GUEST_XCR0_VALUE,
+    address_sizes = const ADDRESS_SIZES,
+    mtrrcap = const IA32_MTRRCAP,
+    physbase0 = const IA32_MTRR_PHYSBASE0,
+    mtrr_base_uc = const GUEST_MTRR_BASE | mtrr::MemoryType::Uncacheable as u64,
+    two_mib = const SIZE_2M,
+    page_size = const PAGE_SIZE,
+    physmask_valid = const PHYSMASK_VALID,
+    apic_base_msr = const IA32_APIC_BASE,
+    apic_mode_bits = const APIC_BASE_MODE,
+    xapic_mode = const APIC_BASE_XAPIC,
+    lapic_version = const LAPIC_VERSION,
+    apic_version_min = const *INTEGRATED_APIC_VERSIONS.start(),
+    apic_version_max = const *INTEGRATED_APIC_VERSIONS.end(),
+);
+
 unsafe extern "C" {
     static guest_code_start: u8;
     static guest_nmi_handler: u8;
@@ -567,10 +800,6 @@ pub struct GuestMemory {
     code: NonNull<u8>,
     stack: NonNull<u8>,
     idt: NonNull<u8>,
-    /// Bytes of guest code copied into the code page.
-    code_len: usize,
-    /// Offset of the guest's NMI handler in its code.
-    nmi_handler_offset: usize,
 }
 
 impl GuestMemory {
@@ -586,14 +815,7 @@ impl GuestMemory {
     /// guest too, so an OS reusing it would stop at an EPT violation. The
     /// gate uses the current CS selector, which the guest state copies.
     pub fn allocate() -> Result<Self, GuestMemoryError> {
-        Self::allocate_with(guest_code(), nmi_handler_offset())
-    }
-
-    /// [`allocate`](Self::allocate) with `code_bytes` as the guest's code and
-    /// its NMI handler at `nmi_handler_offset` in it: the AMD test guest's
-    /// (`hal::amd::test_guest`), which differs from Intel's only in
-    /// VMMCALL and the SVM CPUID bit.
-    pub fn allocate_with(code_bytes: &[u8], nmi_handler_offset: usize) -> Result<Self, GuestMemoryError> {
+        let code_bytes = guest_code();
         if code_bytes.len() > PAGE_SIZE {
             return Err(GuestMemoryError::CodeTooLarge);
         }
@@ -605,13 +827,7 @@ impl GuestMemory {
         // SAFETY: `code` is a fresh two-page allocation, and the code is at
         // most one page (checked above).
         unsafe { core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code.as_ptr(), code_bytes.len()) };
-        let memory = Self {
-            code,
-            stack,
-            idt,
-            code_len: code_bytes.len(),
-            nmi_handler_offset,
-        };
+        let memory = Self { code, stack, idt };
         // SAFETY: the data page is the second page of the fresh `code`
         // allocation, 4 KiB-aligned, so a u32 at its start is in bounds and
         // aligned.
@@ -632,13 +848,13 @@ impl GuestMemory {
 
     /// Number of guest code bytes copied into the code page.
     pub fn code_len(&self) -> usize {
-        self.code_len
+        guest_code().len()
     }
 
     /// Address of the guest's NMI handler in the code page: the target of
     /// the vector 2 gate.
     pub fn nmi_handler(&self) -> u64 {
-        self.code_base() + self.nmi_handler_offset as u64
+        self.code_base() + nmi_handler_offset() as u64
     }
 
     /// Address of the data page, right after the code page. Under the

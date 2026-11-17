@@ -33,6 +33,10 @@ mod x86;
 // The UART driver, shared with the tools (`crates/uart`); imported here so
 // the rest of Aleph0 reaches it as `crate::port`, `crate::serial` and
 // `crate::serial_println!`.
+#[cfg_attr(
+    feature = "amd",
+    allow(unused_imports, reason = "`serial_print` is the Intel backend's")
+)]
 use uart::{port, serial, serial_print, serial_println};
 
 /// Prefix for every line this hypervisor prints, on screen and on serial.
@@ -81,43 +85,9 @@ fn main() -> Status {
     }
 }
 
-/// Everything after the copy, in the resident image: the backend for this
-/// CPU's vendor, picked once at run time, bring-up, and the return to the
-/// firmware.
+/// Everything after the copy, in the resident image: bring-up, and the
+/// return to the firmware.
 fn run() -> Status {
-    match x86::cpuid::Vendor::read() {
-        x86::cpuid::Vendor::Intel => run_intel(),
-        x86::cpuid::Vendor::Amd => run_amd(),
-        x86::cpuid::Vendor::Other(name) => {
-            log!(
-                "CPU vendor {:?}: Aleph0 has no backend for it; returning to firmware.",
-                core::str::from_utf8(&name).unwrap_or("?")
-            );
-            Status::UNSUPPORTED
-        }
-    }
-}
-
-/// AMD's run: SVM bring-up (`hal::amd::bring_up`), and the return to the
-/// firmware.
-fn run_amd() -> Status {
-    log!("AMD CPU: SVM backend.");
-    let status = match hal::amd::bring_up::run() {
-        Ok(hal::amd::bring_up::SvmGuestRun::Finished { exits }) => {
-            log!("Guest finished after {exits} exits; SVM is off again.");
-            Status::SUCCESS
-        }
-        Err(error) => {
-            log!("SVM bring-up stopped: {error:?}.");
-            Status::ABORTED
-        }
-    };
-    log!("Returning to firmware with {status:?}.");
-    status
-}
-
-/// Intel's run: VMX bring-up, and the return to the firmware.
-fn run_intel() -> Status {
     // Bring-up returns once the test guest has stopped, once the firmware
     // runs as the guest, or at the first failure. In the first and last case
     // it has left VMX operation if it entered it, unless VMXOFF failed: then

@@ -1,4 +1,4 @@
-//! Part 2: the VMCB control area and which events exit.
+//! The VMCB control area and which events exit.
 //!
 //! The AMD counterpart of the VMCS execution controls plus the MSR and I/O
 //! bitmaps. Intel chooses control bits the capability MSRs allow and writes
@@ -11,6 +11,7 @@
 //! `exit_bitmaps::msr_bit` and `io_bit`.
 
 /// Intercept word 3 (offset 0x00C). A set bit makes that event #VMEXIT.
+#[allow(dead_code, reason = "the APM's intercept bits, listed whole")]
 pub mod intercept3 {
     pub const INTR: u32 = 1 << 0;
     pub const NMI: u32 = 1 << 1;
@@ -24,6 +25,7 @@ pub mod intercept3 {
 }
 
 /// Intercept word 4 (offset 0x010).
+#[allow(dead_code, reason = "the APM's intercept bits, listed whole")]
 pub mod intercept4 {
     pub const VMRUN: u32 = 1 << 0;
     pub const VMMCALL: u32 = 1 << 1;
@@ -92,6 +94,7 @@ pub struct ControlArea {
 
 impl ControlArea {
     /// An all-zero control area: no intercepts, no nested paging.
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
     pub const fn zeroed() -> Self {
         // SAFETY: every field is an integer or a byte array, for which
         // all-zero is a valid value.

@@ -42,12 +42,9 @@ fn the_high_half_of_the_exit_code_is_combined() {
 }
 
 #[test]
-fn a_fresh_vcpu_reports_a_zero_exit_before_it_runs() {
-    let vcpu = Vcpu {
-        vmcb: Vmcb::zeroed(),
-        gprs: GprFrame::default(),
-    };
-    let outcome = RunOutcome::read(&vcpu.vmcb);
+fn a_fresh_vmcb_reports_a_zero_exit_before_it_runs() {
+    let vmcb = Vmcb::zeroed();
+    let outcome = RunOutcome::read(&vmcb);
     assert_eq!(outcome.exit_code, 0);
     assert!(!outcome.is_invalid());
 }
