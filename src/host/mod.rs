@@ -29,8 +29,8 @@ mod idt;
 mod page_tables;
 
 pub use gdt::{FirmwareSelectors, GdtLayoutError};
-pub use handlers::{nmi_pending, nmis_taken, take_pending_nmi};
-pub use idt::InterruptStack;
+pub use handlers::{HostHooks, install, nmi_pending, nmis_taken, take_pending_nmi};
+pub use idt::{InterruptStack, VECTORS};
 pub use page_tables::{HostPageTables, HostPagingError, PageSize};
 
 #[cfg(feature = "host-fault-test")]

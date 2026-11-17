@@ -24,6 +24,7 @@ use types::{
     OptionalFeatures, ReasonDescription, RecoveryPoint, Refused, Retyped, WalkEnd,
 };
 
+pub mod amd;
 pub mod intel;
 pub mod types;
 

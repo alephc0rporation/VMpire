@@ -1,6 +1,46 @@
 //! CPUID-based feature detection.
 
-use core::arch::x86_64::__cpuid;
+use core::arch::x86_64::{__cpuid, CpuidResult};
+
+/// The CPU's vendor, which picks the backend at run time: VMX on Intel,
+/// SVM on AMD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vendor {
+    /// "GenuineIntel".
+    Intel,
+    /// "AuthenticAMD".
+    Amd,
+    /// Any other vendor string, which Aleph0 has no backend for.
+    Other([u8; 12]),
+}
+
+impl Vendor {
+    /// The vendor CPUID leaf 0 names: its 12-byte string in EBX, EDX, ECX,
+    /// in that order.
+    pub fn from_leaf0(leaf0: CpuidResult) -> Self {
+        let mut name = [0u8; 12];
+        name[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+        name[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+        name[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+        match &name {
+            b"GenuineIntel" => Self::Intel,
+            b"AuthenticAMD" => Self::Amd,
+            _ => Self::Other(name),
+        }
+    }
+
+    /// This CPU's vendor. One CPUID, at startup, picks the backend for the
+    /// whole run.
+    pub fn read() -> Self {
+        Self::from_leaf0(__cpuid(0))
+    }
+}
+
+/// CPUID.(EAX=7,ECX=0):ECX bit 4 (OSPKE): a copy of CR4.PKE.
+pub const CPUID_7_ECX_OSPKE: u32 = 1 << 4;
+/// CPUID leaf of the XSAVE components: subleaf 0 reports in EDX:EAX the XCR0
+/// bits the CPU supports.
+pub const XSAVE_LEAF: u32 = 0xD;
 
 /// CPUID leaf whose EAX is the highest extended leaf.
 const EXTENDED_MAX: u32 = 0x8000_0000;
@@ -35,3 +75,7 @@ pub fn physical_address_bits() -> u8 {
     }
     __cpuid(ADDRESS_SIZES).eax as u8
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/x86/cpuid.rs"]
+mod tests;

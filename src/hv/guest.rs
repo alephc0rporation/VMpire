@@ -567,6 +567,10 @@ pub struct GuestMemory {
     code: NonNull<u8>,
     stack: NonNull<u8>,
     idt: NonNull<u8>,
+    /// Bytes of guest code copied into the code page.
+    code_len: usize,
+    /// Offset of the guest's NMI handler in its code.
+    nmi_handler_offset: usize,
 }
 
 impl GuestMemory {
@@ -582,7 +586,14 @@ impl GuestMemory {
     /// guest too, so an OS reusing it would stop at an EPT violation. The
     /// gate uses the current CS selector, which the guest state copies.
     pub fn allocate() -> Result<Self, GuestMemoryError> {
-        let code_bytes = guest_code();
+        Self::allocate_with(guest_code(), nmi_handler_offset())
+    }
+
+    /// [`allocate`](Self::allocate) with `code_bytes` as the guest's code and
+    /// its NMI handler at `nmi_handler_offset` in it: the AMD test guest's
+    /// (`hal::amd::test_guest`), which differs from Intel's only in
+    /// VMMCALL and the SVM CPUID bit.
+    pub fn allocate_with(code_bytes: &[u8], nmi_handler_offset: usize) -> Result<Self, GuestMemoryError> {
         if code_bytes.len() > PAGE_SIZE {
             return Err(GuestMemoryError::CodeTooLarge);
         }
@@ -594,7 +605,13 @@ impl GuestMemory {
         // SAFETY: `code` is a fresh two-page allocation, and the code is at
         // most one page (checked above).
         unsafe { core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code.as_ptr(), code_bytes.len()) };
-        let memory = Self { code, stack, idt };
+        let memory = Self {
+            code,
+            stack,
+            idt,
+            code_len: code_bytes.len(),
+            nmi_handler_offset,
+        };
         // SAFETY: the data page is the second page of the fresh `code`
         // allocation, 4 KiB-aligned, so a u32 at its start is in bounds and
         // aligned.
@@ -615,13 +632,13 @@ impl GuestMemory {
 
     /// Number of guest code bytes copied into the code page.
     pub fn code_len(&self) -> usize {
-        guest_code().len()
+        self.code_len
     }
 
     /// Address of the guest's NMI handler in the code page: the target of
     /// the vector 2 gate.
     pub fn nmi_handler(&self) -> u64 {
-        self.code_base() + nmi_handler_offset() as u64
+        self.code_base() + self.nmi_handler_offset as u64
     }
 
     /// Address of the data page, right after the code page. Under the

@@ -621,8 +621,8 @@ fn hide_resident_memory(
 fn virtualize_firmware(vcpu: &backend::Vcpu) -> Result<GuestRun, BringUpError> {
     // Before VMLAUNCH: once the firmware is the guest, every firmware call
     // can exit, and one Aleph0 does not handle stops it.
-    let event =
-        resident::watch_exit_boot_services().map_err(|error| BringUpError::ExitBootServicesEvent(error.status()))?;
+    let event = resident::watch_exit_boot_services(crate::x86::cpuid::Vendor::Intel)
+        .map_err(|error| BringUpError::ExitBootServicesEvent(error.status()))?;
     log!("ExitBootServices event created: its VMCALL will tell Aleph0 when boot services end.");
     log!("Launching the firmware in place with VMLAUNCH; its VM exits are reported on serial only.");
     // SAFETY: `prepare_vmcs` wrote the controls, the host state

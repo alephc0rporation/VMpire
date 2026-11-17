@@ -274,6 +274,22 @@ pub fn recovery(rip: u64, vector: u8) -> Option<u64> {
         .map(|(_, _, resume)| resume as u64)
 }
 
+/// [`recovery`] for the RDMSR and WRMSR forwarders alone, which are the same
+/// on both CPUs: the AMD backend adds its own VMMCALL forwarder's point
+/// (`hal::amd::hyperv::recovery`) without reaching Intel's.
+pub fn msr_recovery(rip: u64, vector: u8) -> Option<u64> {
+    if vector != GENERAL_PROTECTION {
+        return None;
+    }
+    [
+        (&raw const hyperv_rdmsr_instruction, &raw const hyperv_rdmsr_refused),
+        (&raw const hyperv_wrmsr_instruction, &raw const hyperv_wrmsr_refused),
+    ]
+    .into_iter()
+    .find(|&(at, _)| at as u64 == rip)
+    .map(|(_, resume)| resume as u64)
+}
+
 /// The guest's hypercall in `registers`, made again in root operation:
 /// Hyper-V's results replace them.
 ///
