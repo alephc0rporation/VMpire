@@ -1,0 +1,136 @@
+//! Unit tests for `src/hv/vmexit/handler.rs`.
+//!
+//! Compiled only by `cargo test-host`. That file includes this one with
+//! `#[path]` as its child module `tests`, so `use super::*` reaches its
+//! private items.
+
+use super::*;
+use crate::hal::intel::instruction::VmxFail;
+use crate::hal::intel::vmcs::VmcsError;
+
+#[test]
+fn next_rip_adds_the_instruction_length() {
+    assert_eq!(next_rip(0x1000, 3), Some(0x1003));
+}
+
+#[test]
+fn next_rip_may_reach_the_last_address() {
+    // A 15-byte instruction at ...FFF0 ends at ...FFFE; the next RIP is then the last representable address.
+    assert_eq!(next_rip(u64::MAX - 15, 15), Some(u64::MAX));
+}
+
+#[test]
+fn next_rip_past_the_top_of_the_address_space_is_refused() {
+    assert_eq!(next_rip(u64::MAX - 14, 15), None);
+    assert_eq!(next_rip(0xFFFF_FFFF_FFFF_FFFE, 3), None);
+}
+
+#[test]
+fn next_rip_may_reach_the_last_canonical_address_of_the_lower_half() {
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFFC, 3), Some(0x0000_7FFF_FFFF_FFFF));
+}
+
+#[test]
+fn next_rip_past_the_lower_half_is_refused() {
+    // A 1-byte instruction at the last canonical byte of the lower half: the add does not overflow, but
+    // 0x0000_8000_0000_0000 is non-canonical.
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFFF, 1), None);
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFF1, 15), None);
+}
+
+#[test]
+fn resume_failures_read_as_the_report_has_always_printed_them() {
+    // The report adds "; not resuming." after each.
+    assert_eq!(ResumeFailure::RipUnreadable.to_string(), "guest RIP unreadable");
+    assert_eq!(
+        ResumeFailure::NextRipInvalid.to_string(),
+        "next guest RIP would wrap or be non-canonical"
+    );
+    let write = ResumeFailure::Write {
+        what: "advance guest RIP",
+        error: VmcsError::VmFailValid,
+    };
+    assert_eq!(write.to_string(), "could not advance guest RIP (VmFailValid)");
+    assert_eq!(
+        ResumeFailure::GrantWrite(VmxFail::Invalid).to_string(),
+        "could not make the protected page writable (INVEPT Invalid)"
+    );
+}
+
+#[test]
+fn only_a_resumed_outcome_lets_the_guest_go_on() {
+    assert!(Outcome::ResumeFailed(ResumeFailure::NoProtectedPage).stops());
+    assert_eq!(
+        Outcome::ResumeFailed(ResumeFailure::NoProtectedPage).action(),
+        ExitAction::Unexpected
+    );
+    assert!(Outcome::Stopped(ExitAction::Finished).stops());
+    assert_eq!(Outcome::Stopped(ExitAction::Finished).action(), ExitAction::Finished);
+}
+
+#[test]
+fn guest_mtrr_failures_say_what_went_wrong() {
+    assert_eq!(
+        ResumeFailure::GuestMtrrs(MtrrAccessFailure::NotPublished).to_string(),
+        "the guest's MTRRs were never set up"
+    );
+    assert_eq!(
+        ResumeFailure::GuestMtrrs(MtrrAccessFailure::Invept(VmxFail::Invalid)).to_string(),
+        "EPT took the guest's MTRR types, but INVEPT failed (Invalid)"
+    );
+}
+
+#[test]
+fn a_cr_write_source_reads_every_register_including_rsp() {
+    // The frame holds each register's number as its value, so a correct
+    // decode returns the number; RSP (4) is not in the frame, it is GUEST_RSP.
+    let frame = RegisterFrame {
+        rax: 0,
+        rbx: 3,
+        rcx: 1,
+        rdx: 2,
+        rsi: 6,
+        rdi: 7,
+        rbp: 5,
+        r8: 8,
+        r9: 9,
+        r10: 10,
+        r11: 11,
+        r12: 12,
+        r13: 13,
+        r14: 14,
+        r15: 15,
+    };
+    let rsp = Some(Ok(4));
+    for number in 0u8..16 {
+        assert_eq!(
+            cr_source_value(number, &frame, rsp),
+            Some(u64::from(number)),
+            "register {number}"
+        );
+    }
+    // RSP as the source, but GUEST_RSP unreadable: no value.
+    assert_eq!(cr_source_value(4, &frame, Some(Err(VmcsError::VmFailValid))), None);
+    assert_eq!(cr_source_value(4, &frame, None), None);
+}
+
+#[test]
+fn the_guest_resumes_in_the_phase_the_exit_found() {
+    for found in [Phase::BootServices, Phase::Runtime] {
+        assert_eq!(resume_phase(ExitEvent::Halted, found), found);
+        assert_eq!(resume_phase(ExitEvent::TestVmcall, found), found);
+    }
+}
+
+#[test]
+fn the_exit_boot_services_vmcall_starts_the_runtime_phase_for_good() {
+    assert_eq!(
+        resume_phase(ExitEvent::BootServicesEnded, Phase::BootServices),
+        Phase::Runtime
+    );
+    // A second one, faked by the guest, changes nothing.
+    assert_eq!(
+        resume_phase(ExitEvent::BootServicesEnded, Phase::Runtime),
+        Phase::Runtime
+    );
+}

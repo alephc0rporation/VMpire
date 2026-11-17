@@ -23,13 +23,20 @@ macro_rules! log {
 }
 
 mod bring_up;
+mod hal;
+mod host;
+mod hv;
 mod output;
 mod resident;
-mod vmx;
+mod x86;
 
 // The UART driver, shared with the tools (`crates/uart`); imported here so
 // the rest of Aleph0 reaches it as `crate::port`, `crate::serial` and
 // `crate::serial_println!`.
+#[cfg_attr(
+    feature = "amd",
+    allow(unused_imports, reason = "`serial_print` is the Intel backend's")
+)]
 use uart::{port, serial, serial_print, serial_println};
 
 /// Prefix for every line this hypervisor prints, on screen and on serial.
