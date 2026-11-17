@@ -13,12 +13,12 @@ Rules (same as the Intel redo):
 - Intel stays as it is. AMD adds files; shared code (`bring_up`, `hv`, `host`,
   `resident`, `x86`) does not change unless section 5 says so.
 
-Status (2026-11-17): **done for the built-in test guest.** The AMD code is
-behind the six traits (`src/hal/amd/{virtualization,vcpu,vm_exit,
+Status (2026-11-18): **done, test guest and firmware guest.** The AMD code
+is behind the six traits (`src/hal/amd/{virtualization,vcpu,vm_exit,
 nested_paging,intercepts,hypercall}.rs`), picked with `--features amd`, and
-the shared code runs it as it runs Intel. Section 9 says what was done.
-Not done: the firmware guest on AMD (`run_in_place`). Not run yet: AMD on
-QEMU or hardware, Intel on Hyper-V.
+the shared code runs it as it runs Intel. Section 9 says what was done. CI
+builds and tests both backends. Not run yet: AMD on QEMU or hardware, Intel
+on Hyper-V.
 
 ---
 
@@ -479,8 +479,13 @@ Each D item of section 8, as built:
 - **D11** Host PAT: `Vcpu::run` switches to `npt::HOST_PAT` with the host
   environment; `Vcpu::release` puts the firmware's back; `disable` restores
   CR0/CR4 and clears EFER.SVME.
-- **D12** Firmware guest not built: `set_guest_state(InPlace)` and
-  `run_in_place` return `FirmwareGuestNotBuilt`.
+- **D12** Firmware guest built (2026-11-18), as Intel's `launch_in_place`:
+  `run_in_place` writes the guest's RIP (the instruction after it), RSP and
+  RFLAGS into the VMCB and the registers into the frame, then runs the loop
+  on a 64 KiB run stack of its own (Intel's VM-exit stack size). The
+  firmware goes on as the guest on its own stack; a stop halts in the exit
+  handler; only a refused first VMRUN returns, as a launch failure. The test
+  guest's loop runs on that stack too, so `exit_stack_usage` reports it.
 - **D13** `REASON_COUNTERS = 0x401`; VMEXIT_INVALID counts as "other".
 
 Other changes: `HostTables` has `gdtr_limit` and `idtr_limit` (AMD loads

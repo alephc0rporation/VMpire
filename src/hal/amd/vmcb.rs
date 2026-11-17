@@ -88,7 +88,6 @@ pub struct Vmcb {
 
 impl Vmcb {
     /// An all-zero VMCB.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by the unit tests"))]
     pub const fn zeroed() -> Self {
         // SAFETY: every field is an integer or an array of integers, for
         // which all-zero bytes are a valid value.

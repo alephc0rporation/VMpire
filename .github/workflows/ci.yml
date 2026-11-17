@@ -1,5 +1,7 @@
-# The checks CONTRIBUTING.md requires before every pull request. Nothing here
-# executes VMX instructions; that still needs a boot under Hyper-V.
+# The checks CONTRIBUTING.md requires before every pull request, for both
+# backends (Intel by default, AMD with `--features amd`). Nothing here
+# executes VMX or SVM instructions; that still needs a boot under Hyper-V
+# (Intel) or QEMU with SVM / AMD hardware (AMD).
 name: CI
 
 on:
@@ -23,12 +25,17 @@ jobs:
           tool: cargo-hack
       - run: cargo build
       - run: cargo test-host
+      # The AMD backend (`--features amd`): its build and the whole unit test
+      # suite with it. Nothing here executes SVM instructions either.
+      - run: cargo build --features amd
+      - run: cargo test-host --features amd
       - run: cargo fmt --all --check
       # Every package of the UEFI build, once with no features, once with
       # each feature alone and once with all of them, so code behind a test
       # switch cannot stop compiling unnoticed.
       - run: cargo hack clippy --workspace --each-feature -- -D warnings
       - run: cargo clippy --target x86_64-pc-windows-msvc --tests -- -D warnings
+      - run: cargo clippy --target x86_64-pc-windows-msvc --tests --features amd -- -D warnings
       - run: cargo test -p ebs-harness --target x86_64-pc-windows-msvc
       - run: cargo clippy -p ebs-harness --target x86_64-pc-windows-msvc --tests -- -D warnings
       - run: cargo test -p uart --target x86_64-pc-windows-msvc

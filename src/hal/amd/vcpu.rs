@@ -5,11 +5,15 @@
 //! (`hv::vmexit::handle_exit`) through [`VmExit`](super::VmExit).
 //!
 //! Where Intel's VM exit loads the host state from the VMCS, VMRUN saves the
-//! state it runs on and every #VMEXIT restores it, so [`Vcpu::run`] switches
+//! state it runs on and every #VMEXIT restores it, so the run loop switches
 //! to Aleph0's host environment first ([`switch_to_host`]), as the AMD
-//! bring-up did.
+//! bring-up did. As Intel's exits run on the VM-exit stack, the run loop
+//! runs on a stack of its own ([`RUN_STACK_SIZE`]): for the firmware guest
+//! ([`Vcpu::run_in_place`]) the firmware goes on as the guest on the stack it
+//! ran on, so the loop cannot share it.
 
 use core::arch::asm;
+use core::mem::offset_of;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -39,6 +43,11 @@ const RFLAGS_RESERVED: u64 = 0x2;
 const DR7_RESET: u64 = 0x400;
 const DR6_RESET: u64 = 0xFFFF_0FF0;
 
+/// The run loop's stack: 64 KiB, as Intel's VM-exit stack, whose exits
+/// used 21168 bytes in a debug build.
+const RUN_STACK_PAGES: usize = 16;
+const RUN_STACK_SIZE: usize = RUN_STACK_PAGES * PAGE_SIZE;
+
 /// Everything one vCPU keeps, in pages of its own that are never freed: the
 /// VMCB, the registers the VMCB does not hold, and what the run loop
 /// remembers between exits.
@@ -63,6 +72,8 @@ pub(super) struct VcpuState {
     /// The firmware's PAT, which the run replaced with [`HOST_PAT`] and
     /// [`Vcpu::release`] puts back; `None` until the run switched.
     firmware_pat: Option<u64>,
+    /// How the run loop ended, for the code that switched to its stack.
+    stop: Option<GuestStop<VcpuError>>,
 }
 
 /// The vCPU current on this CPU: [`Vcpu::create`] sets it,
@@ -93,9 +104,11 @@ pub(super) unsafe fn current_control<'a>() -> &'a mut ControlArea {
     unsafe { &mut (*current()).vmcb.control }
 }
 
-/// The VMCB, its host state page and the run loop's memory.
+/// The VMCB, its host state page and the run loop's memory and stack.
 pub struct Vcpu {
     state: NonNull<VcpuState>,
+    /// The run loop's stack, [`RUN_STACK_SIZE`] bytes, zeroed at first.
+    stack: NonNull<u8>,
 }
 
 /// Why a vCPU step failed.
@@ -109,9 +122,6 @@ pub enum VcpuError {
     NoNextRipSave,
     /// The run started before the host state was configured.
     HostStateMissing,
-    /// The firmware run, where the firmware itself becomes the guest, is
-    /// not built for SVM yet.
-    FirmwareGuestNotBuilt,
     /// VMRUN refused the guest state (exit code -1) at the first entry.
     InvalidState,
     /// The VMCB self-test read back something else than was written.
@@ -121,6 +131,22 @@ pub enum VcpuError {
 impl Vcpu {
     fn state(&self) -> *mut VcpuState {
         self.state.as_ptr()
+    }
+
+    /// Top of the run stack, 16-byte aligned for the x64 calling convention.
+    fn stack_top(&self) -> u64 {
+        let top = self.stack.as_ptr() as u64 + RUN_STACK_SIZE as u64;
+        assert_eq!(top % 16, 0);
+        top
+    }
+
+    /// The host environment the run switches to, or why there is none.
+    fn host_configured(&self) -> Result<(), VcpuError> {
+        // SAFETY: the guest is not running, so nothing writes the state.
+        match unsafe { (*self.state()).host } {
+            Some(_) => Ok(()),
+            None => Err(VcpuError::HostStateMissing),
+        }
     }
 }
 
@@ -349,6 +375,117 @@ fn store_registers(state: &mut VcpuState, frame: &GuestRegisters) {
     };
 }
 
+/// The AMD exit handler's loop, on the run stack: switch to the host
+/// environment, then for each round, with GIF clear, open the windows the
+/// exit handler asked for; VMRUN; handle the run loop's own IRET and #DB
+/// exits; give every other exit to the shared exit handler. Returns how the
+/// guest stopped; for the firmware only a refused first VMRUN returns, any
+/// other stop halts in the exit handler.
+///
+/// # Safety
+///
+/// The vCPU is current and configured, the guest not running, so nothing
+/// else uses `state`.
+unsafe fn run_loop(state: *mut VcpuState) -> GuestStop<VcpuError> {
+    // SAFETY: the caller guarantees the vCPU is current and configured,
+    // and the guest not running, so nothing else uses the state.
+    let Some((host, host_cr4)) = (unsafe { (*state).host }) else {
+        return GuestStop::LaunchFailed {
+            error: VcpuError::HostStateMissing,
+        };
+    };
+    // SAFETY: PAT exists on every 64-bit CPU. The host tables are
+    // complete and never freed (`configure_host_state`).
+    unsafe {
+        (*state).firmware_pat = Some(msr::rdmsr(IA32_PAT));
+        switch_to_host(&host, host_cr4);
+    }
+    let mut entered = false;
+    loop {
+        // 1. The windows, with GIF clear.
+        clgi();
+        // SAFETY: the guest is stopped; only this loop and the exit
+        // handler (not running now) use the state.
+        let window = prepare_windows(unsafe { &mut *state });
+        let code = if let Some(window) = window {
+            stgi();
+            match window {
+                Window::Nmi => vm_exit::NMI_WINDOW,
+                Window::Interrupt => vm_exit::INTERRUPT_WINDOW,
+            }
+        } else {
+            // 2. VMRUN.
+            // SAFETY: SVM is on, the VMCB describes the guest the vCPU
+            // was configured with, and the host state page is live and
+            // never freed. Identity-mapped memory makes the addresses
+            // physical.
+            unsafe {
+                let vmcb = &raw mut (*state).vmcb as u64;
+                svm_vmrun(vmcb, (*state).host_state, &raw mut (*state).gprs);
+            }
+            // SAFETY: the guest stopped at this exit.
+            let state = unsafe { &mut *state };
+            let outcome = RunOutcome::read(&state.vmcb);
+            if outcome.is_invalid() {
+                if !entered {
+                    return GuestStop::LaunchFailed {
+                        error: VcpuError::InvalidState,
+                    };
+                }
+                // A resume the CPU refused: the stop report of the last
+                // exit, as Intel's failed VMRESUME (`vmresume_failed`).
+                crate::output::set_phase(crate::output::Phase::VmExit);
+                crate::serial_println!(
+                    "{} VMRUN refused the guest state (exit code -1); stopping the guest; {}.",
+                    crate::TAG,
+                    crate::hv::vmexit::after_stop(GuestKind::SELECTED)
+                );
+                crate::hv::vmexit::stop_after_failed_resume(&registers(state));
+                return GuestStop::ResumeFailed {
+                    error: VcpuError::InvalidState,
+                };
+            }
+            entered = true;
+            let code = outcome.exit_code;
+            // The CPU took the queued event or reported it in
+            // EXITINTINFO; the first run's flush is done.
+            let control = &mut state.vmcb.control;
+            control.event_inj = 0;
+            control.tlb_control = tlb_control::NONE;
+            state.nmi = state.nmi.at_exit(state.vmcb.save.rip);
+            if own_exit(state, code) {
+                continue;
+            }
+            code as u32
+        };
+
+        // 3. The exit handler.
+        // SAFETY: as above.
+        let mut frame = registers(unsafe { &*state });
+        // SAFETY: exit context: SVM on, this vCPU current, the guest
+        // stopped at this exit (or at the window the loop opened).
+        let mut exit = unsafe { VmExit::at(state, window.is_some().then_some(code)) };
+        let (action, number) = crate::hv::vmexit::handle_exit(&mut exit, &mut frame);
+        // SAFETY: as above.
+        store_registers(unsafe { &mut *state }, &frame);
+        match action {
+            ExitAction::Resume(_) => {}
+            ExitAction::Finished => return GuestStop::Finished { exits: number },
+            ExitAction::Unexpected => return GuestStop::Unexpected { number, reason: code },
+        }
+    }
+}
+
+/// [`run_loop`] for the code that switched to the run stack: keeps how the
+/// guest stopped in the state, and returns to the stack it came from.
+extern "efiapi" fn run_loop_entry(state: *mut VcpuState) {
+    // SAFETY: `Vcpu::run` and `Vcpu::run_in_place` pass the current vCPU's
+    // state, configured, with the guest not running.
+    let stop = unsafe { run_loop(state) };
+    // SAFETY: as above; the loop has ended.
+    unsafe { (*state).stop = Some(stop) };
+}
+
 impl crate::hal::Vcpu for Vcpu {
     type Error = VcpuError;
 
@@ -356,15 +493,29 @@ impl crate::hal::Vcpu for Vcpu {
         let pages = size_of::<VcpuState>().div_ceil(PAGE_SIZE);
         let state = allocate_zeroed_pages(pages, VcpuError::AllocationFailed)?.cast::<VcpuState>();
         let host_state = allocate_zeroed_page(VcpuError::AllocationFailed)?.as_ptr() as u64;
-        // SAFETY: a fresh zeroed, page-aligned allocation as long as a
-        // `VcpuState`, which nothing else refers to; all-zero is a valid
-        // `VcpuState` (`None` options, false flags). Never freed.
-        unsafe { (*state.as_ptr()).host_state = host_state };
+        let stack = allocate_zeroed_pages(RUN_STACK_PAGES, VcpuError::AllocationFailed)?;
+        // SAFETY: a fresh page-aligned allocation as long as a `VcpuState`,
+        // which nothing else refers to. Never freed.
+        unsafe {
+            state.as_ptr().write(VcpuState {
+                vmcb: Vmcb::zeroed(),
+                gprs: GprFrame::default(),
+                nmi: NmiState::default(),
+                nmi_window: AtomicBool::new(false),
+                interrupt_window: AtomicBool::new(false),
+                host_state,
+                host: None,
+                firmware_pat: None,
+                stop: None,
+            });
+        }
+        let vcpu = Self { state, stack };
         log!(
-            "VMCB allocated at {:#018x}; host state page at {host_state:#018x}.",
-            state.as_ptr() as u64
+            "VMCB allocated at {:#018x}; host state page at {host_state:#018x}; run stack top={:#018x} size={RUN_STACK_SIZE}.",
+            state.as_ptr() as u64,
+            vcpu.stack_top(),
         );
-        Ok(Self { state })
+        Ok(vcpu)
     }
 
     unsafe fn create(&mut self) -> Result<(), VcpuError> {
@@ -497,8 +648,11 @@ impl crate::hal::Vcpu for Vcpu {
     }
 
     unsafe fn set_guest_state(&self, entry: GuestEntry) -> Result<(), VcpuError> {
-        let GuestEntry::At { rip, rsp, idtr } = entry else {
-            return Err(VcpuError::FirmwareGuestNotBuilt);
+        // The firmware's RIP, RSP and RFLAGS are written by `run_in_place`,
+        // which starts it where it is.
+        let (rip, rsp, idtr) = match entry {
+            GuestEntry::At { rip, rsp, idtr } => (rip, rsp, idtr),
+            GuestEntry::InPlace { idtr } => (0, 0, idtr),
         };
         // SAFETY: as for `configure_controls`.
         let vmcb = unsafe { &mut (*self.state()).vmcb };
@@ -527,122 +681,137 @@ impl crate::hal::Vcpu for Vcpu {
             vmcb.save.cs.selector,
             vmcb.save.cs.attrib,
         );
+        if let GuestEntry::InPlace { .. } = entry {
+            log!(
+                "Guest rip, rsp and rflags are placeholders: the in-place launch writes its own, and the code after it goes on as the guest."
+            );
+        }
         Ok(())
     }
 
-    /// The AMD exit handler's loop: switch to the host environment, then
-    /// for each round, with GIF clear, open the windows the exit handler
-    /// asked for; VMRUN; handle the run loop's own IRET and #DB exits; give
-    /// every other exit to the shared exit handler.
+    /// The run loop ([`run_loop`]) on the run stack, until the test guest
+    /// stops.
     unsafe fn run(&self) -> GuestStop<VcpuError> {
+        if let Err(error) = self.host_configured() {
+            return GuestStop::LaunchFailed { error };
+        }
         let state = self.state();
-        // SAFETY: the caller guarantees the vCPU is current and configured,
-        // and the guest not running, so nothing else uses the state.
-        let Some((host, host_cr4)) = (unsafe { (*state).host }) else {
-            return GuestStop::LaunchFailed {
-                error: VcpuError::HostStateMissing,
-            };
-        };
-        // SAFETY: PAT exists on every 64-bit CPU. The host tables are
-        // complete and never freed (`configure_host_state`).
+        // SAFETY: switches to the run stack, Aleph0's own and never freed,
+        // calls the loop with the Microsoft x64 ABI (RSP 16-byte aligned at
+        // the call, 32 bytes of shadow space) and switches back. R12 keeps
+        // the caller's RSP across the call (callee-saved); every register the
+        // ABI lets the callee change is clobbered.
         unsafe {
-            (*state).firmware_pat = Some(msr::rdmsr(IA32_PAT));
-            switch_to_host(&host, host_cr4);
+            asm!(
+                "mov r12, rsp",
+                "mov rsp, {top}",
+                "sub rsp, 32",
+                "call {entry}",
+                "mov rsp, r12",
+                top = in(reg) self.stack_top(),
+                entry = sym run_loop_entry,
+                in("rcx") state,
+                out("r12") _,
+                clobber_abi("efiapi"),
+            );
         }
-        let mut entered = false;
-        loop {
-            // 1. The windows, with GIF clear.
-            clgi();
-            // SAFETY: the guest is stopped; only this loop and the exit
-            // handler (not running now) use the state.
-            let window = prepare_windows(unsafe { &mut *state });
-            let code = if let Some(window) = window {
-                stgi();
-                match window {
-                    Window::Nmi => vm_exit::NMI_WINDOW,
-                    Window::Interrupt => vm_exit::INTERRUPT_WINDOW,
-                }
-            } else {
-                // 2. VMRUN.
-                // SAFETY: SVM is on, the VMCB describes the guest the vCPU
-                // was configured with, and the host state page is live and
-                // never freed. Identity-mapped memory makes the addresses
-                // physical.
-                unsafe {
-                    let vmcb = &raw mut (*state).vmcb as u64;
-                    svm_vmrun(vmcb, (*state).host_state, &raw mut (*state).gprs);
-                }
-                // SAFETY: the guest stopped at this exit.
-                let state = unsafe { &mut *state };
-                let outcome = RunOutcome::read(&state.vmcb);
-                if outcome.is_invalid() {
-                    if !entered {
-                        return GuestStop::LaunchFailed {
-                            error: VcpuError::InvalidState,
-                        };
-                    }
-                    // A resume the CPU refused: the stop report of the last
-                    // exit, as Intel's failed VMRESUME (`vmresume_failed`).
-                    crate::output::set_phase(crate::output::Phase::VmExit);
-                    crate::serial_println!(
-                        "{} VMRUN refused the guest state (exit code -1); stopping the guest; {}.",
-                        crate::TAG,
-                        crate::hv::vmexit::after_stop(GuestKind::SELECTED)
-                    );
-                    crate::hv::vmexit::stop_after_failed_resume(&registers(state));
-                    return GuestStop::ResumeFailed {
-                        error: VcpuError::InvalidState,
-                    };
-                }
-                entered = true;
-                let code = outcome.exit_code;
-                // The CPU took the queued event or reported it in
-                // EXITINTINFO; the first run's flush is done.
-                let control = &mut state.vmcb.control;
-                control.event_inj = 0;
-                control.tlb_control = tlb_control::NONE;
-                state.nmi = state.nmi.at_exit(state.vmcb.save.rip);
-                if own_exit(state, code) {
-                    continue;
-                }
-                code as u32
-            };
-
-            // 3. The exit handler.
-            // SAFETY: as above.
-            let mut frame = registers(unsafe { &*state });
-            // SAFETY: exit context: SVM on, this vCPU current, the guest
-            // stopped at this exit (or at the window the loop opened).
-            let mut exit = unsafe { VmExit::at(state, window.is_some().then_some(code)) };
-            let (action, number) = crate::hv::vmexit::handle_exit(&mut exit, &mut frame);
-            // SAFETY: as above.
-            store_registers(unsafe { &mut *state }, &frame);
-            match action {
-                ExitAction::Resume(_) => {}
-                ExitAction::Finished => return GuestStop::Finished { exits: number },
-                ExitAction::Unexpected => return GuestStop::Unexpected { number, reason: code },
-            }
-        }
+        // SAFETY: the loop has ended; nothing else uses the state.
+        unsafe { (*state).stop.take() }.expect("the run loop records how the guest stopped")
     }
 
-    /// Not built for SVM yet: the firmware run needs a hypervisor stack of
-    /// its own and a run loop that never returns.
+    /// The firmware goes on as the guest, as Intel's `launch_in_place`: the
+    /// guest's RIP is the instruction after the switch, its RSP and RFLAGS
+    /// the ones it runs with, and its other registers the ones the code
+    /// around it keeps (the run loop loads them from the frame at VMRUN).
+    /// The run loop then runs on the run stack and never comes back here,
+    /// except when the first VMRUN is refused.
     unsafe fn run_in_place(&self) -> Result<(), GuestStop<VcpuError>> {
-        Err(GuestStop::LaunchFailed {
-            error: VcpuError::FirmwareGuestNotBuilt,
-        })
+        if let Err(error) = self.host_configured() {
+            return Err(GuestStop::LaunchFailed { error });
+        }
+        let state = self.state();
+        // SAFETY: as for `configure_controls`; the addresses are taken, not
+        // references, so the asm below writes the fields directly.
+        let (save, gprs) = unsafe { (&raw mut (*state).vmcb.save, &raw mut (*state).gprs) };
+        let failed: u64;
+        // SAFETY: writes RIP, RSP and RFLAGS into the save area and the
+        // registers into the frame, then switches stacks as `run` does. The
+        // guest starts at `2:` with RSP as it is here and every register as
+        // stored, so the code after this block goes on as before, as the
+        // guest; registers the ABI lets a call change, and R12, are
+        // clobbered. PUSHFQ and POP balance before RSP is stored. If the loop
+        // returns (the first VMRUN refused), RSP comes back from R12.
+        unsafe {
+            asm!(
+                "lea rax, [rip + 2f]",
+                "mov [{save} + {rip}], rax",
+                "pushfq",
+                "pop rax",
+                "mov [{save} + {rflags}], rax",
+                "mov [{save} + {rsp}], rsp",
+                "mov [{gprs} + {rbx}], rbx",
+                "mov [{gprs} + {rsi}], rsi",
+                "mov [{gprs} + {rdi}], rdi",
+                "mov [{gprs} + {rbp}], rbp",
+                "mov [{gprs} + {r12}], r12",
+                "mov [{gprs} + {r13}], r13",
+                "mov [{gprs} + {r14}], r14",
+                "mov [{gprs} + {r15}], r15",
+                "mov r12, rsp",
+                "mov rsp, {top}",
+                "sub rsp, 32",
+                "call {entry}",
+                "mov rsp, r12",
+                "mov eax, 1",
+                "jmp 3f",
+                // The guest starts here.
+                "2:",
+                "xor eax, eax",
+                "3:",
+                save = in(reg) save,
+                gprs = in(reg) gprs,
+                top = in(reg) self.stack_top(),
+                rip = const offset_of!(SaveArea, rip),
+                rflags = const offset_of!(SaveArea, rflags),
+                rsp = const offset_of!(SaveArea, rsp),
+                rbx = const offset_of!(GprFrame, rbx),
+                rsi = const offset_of!(GprFrame, rsi),
+                rdi = const offset_of!(GprFrame, rdi),
+                rbp = const offset_of!(GprFrame, rbp),
+                r12 = const offset_of!(GprFrame, r12),
+                r13 = const offset_of!(GprFrame, r13),
+                r14 = const offset_of!(GprFrame, r14),
+                r15 = const offset_of!(GprFrame, r15),
+                entry = sym run_loop_entry,
+                in("rcx") state,
+                out("rax") failed,
+                out("r12") _,
+                clobber_abi("efiapi"),
+            );
+        }
+        if failed == 0 {
+            return Ok(());
+        }
+        // SAFETY: the loop has ended; nothing else uses the state.
+        Err(unsafe { (*state).stop.take() }.expect("the run loop records how the guest stopped"))
     }
 
-    /// None: the run loop runs on the stack bring-up called it on.
+    /// The run stack: bytes from its lowest written word to its top.
     unsafe fn exit_stack_usage(&self) -> Option<(usize, usize)> {
-        None
+        // SAFETY: the stack's own allocation, RUN_STACK_SIZE bytes, which no
+        // run loop writes now (the caller guarantees the guest stopped).
+        let words = unsafe {
+            core::slice::from_raw_parts(self.stack.as_ptr().cast::<u64>(), RUN_STACK_SIZE / size_of::<u64>())
+        };
+        let used = words
+            .iter()
+            .position(|&word| word != 0)
+            .map_or(0, |lowest| (words.len() - lowest) * size_of::<u64>());
+        Some((used, RUN_STACK_SIZE))
     }
 
     fn report_error(error: VcpuError) {
         match error {
-            VcpuError::FirmwareGuestNotBuilt => {
-                log!("The firmware guest is not built for SVM yet; build with `test-guest`.")
-            }
             VcpuError::InvalidState => log!("VMRUN refused the guest state (exit code -1)."),
             error => log!("VMCB step failed: {error:?}"),
         }
